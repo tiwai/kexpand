@@ -18,12 +18,15 @@ struct BlobShard {
 impl BlobShard {
     fn spawn(output_dir: &Path, idx: usize) -> Result<Self> {
         let marks_file = output_dir.join(format!(".git/blob-marks-{idx}.txt"));
+        // Use a CWD-relative path for --export-marks so it resolves correctly
+        // whether output_dir is absolute or relative (avoids path doubling).
+        let marks_rel = format!(".git/blob-marks-{idx}.txt");
         let mut child = Command::new("git")
             .args([
                 "-c", "pack.compression=0",
                 "fast-import",
                 "--done",
-                &format!("--export-marks={}", marks_file.display()),
+                &format!("--export-marks={marks_rel}"),
             ])
             .current_dir(output_dir)
             .stdin(Stdio::piped())
