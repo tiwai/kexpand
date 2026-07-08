@@ -34,7 +34,7 @@ struct Cli {
     output: PathBuf,
 
     /// Branch name to create in the output repo
-    #[arg(short = 'b', long, default_value = "expand")]
+    #[arg(short = 'b', long, default_value = "master")]
     branch: String,
 
     /// Number of threads for parallel parsing (0 = auto)

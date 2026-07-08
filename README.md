@@ -55,7 +55,7 @@ Options:
                              [default: ~/git/linus]
   -o, --output <OUTPUT>      Output git repo to create
   -b, --branch <BRANCH>      Branch name in the output repo
-                             [default: expand]
+                             [default: master]
   -j, --jobs <JOBS>          Threads for parallel parsing (0 = auto)
                              [default: 0]
       --base-tag <BASE_TAG>  Base kernel tag (auto-detected from rpm/config.sh)
