@@ -126,8 +126,11 @@ impl BlobShardPool {
 }
 
 fn read_marks_file(path: &Path) -> Result<HashMap<u64, git2::Oid>> {
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("opening marks file {}", path.display()))?;
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(e) => return Err(e).with_context(|| format!("opening marks file {}", path.display())),
+    };
     let mut map = HashMap::new();
     for line in BufReader::new(file).lines() {
         let line = line.context("reading marks file")?;
