@@ -112,6 +112,10 @@ fn build_message(meta: &PatchMeta) -> String {
     };
 
     let mut msg = subject;
+    if !meta.body.is_empty() {
+        msg.push_str("\n\n");
+        msg.push_str(&meta.body);
+    }
     let mut extras = String::new();
     if !meta.references.is_empty() {
         extras.push_str(&format!("References: {}\n", meta.references));

@@ -13,6 +13,9 @@ pub struct PatchMeta {
     pub subject: String,
     pub references: String,
     pub patch_mainline: String,
+    /// Description body: text after the blank line following RFC 2822 headers,
+    /// up to (but not including) the `---` separator line.
+    pub body: String,
 }
 
 /// Parse email-style headers from the raw bytes of a patch file's header section
@@ -25,12 +28,19 @@ pub fn parse_header(raw: &[u8], source_path: PathBuf) -> PatchMeta {
     let mut subject = String::new();
     let mut references = String::new();
     let mut patch_mainline = String::new();
+    let mut body = String::new();
 
     // Split into lines for header parsing
     let lines = split_lines(raw);
     let mut i = 0;
+
+    // Phase 1: parse RFC 2822-style headers until the first blank line.
     while i < lines.len() {
         let line = lines[i];
+        if line.is_empty() {
+            i += 1;
+            break; // blank line ends the header section
+        }
         if line.starts_with(b"From: ") || line.starts_with(b"From:") {
             let val = header_value(line, b"From:");
             parse_from(val, &mut author_name, &mut author_email);
@@ -69,6 +79,27 @@ pub fn parse_header(raw: &[u8], source_path: PathBuf) -> PatchMeta {
         i += 1;
     }
 
+    // Phase 2: collect the body — everything after the blank line up to `---`.
+    let mut body_lines: Vec<&[u8]> = Vec::new();
+    while i < lines.len() {
+        let line = lines[i];
+        if line == b"---" {
+            break;
+        }
+        body_lines.push(line);
+        i += 1;
+    }
+    // Trim trailing blank lines from the body.
+    while body_lines.last().map_or(false, |l| l.is_empty()) {
+        body_lines.pop();
+    }
+    if !body_lines.is_empty() {
+        body = body_lines.iter()
+            .map(|l| to_str(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+
     PatchMeta {
         source_path,
         author_name,
@@ -78,6 +109,7 @@ pub fn parse_header(raw: &[u8], source_path: PathBuf) -> PatchMeta {
         subject,
         references,
         patch_mainline,
+        body,
     }
 }
 
