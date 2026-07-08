@@ -33,7 +33,7 @@ slow for a large series.
 - Rust toolchain (edition 2021)
 - A clone of [linus/linux](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git)
   (read-only access is sufficient)
-- A clone of SUSE's kernel-source.git checked out on the target branch
+- A clone of SUSE's kernel-source.git (read-only access is sufficient)
 
 ## Build
 
