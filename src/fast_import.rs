@@ -127,5 +127,9 @@ fn build_message(meta: &PatchMeta) -> String {
         msg.push_str("\n\n");
         msg.push_str(&extras);
     }
+    let patch_name = meta.source_path.to_str().unwrap_or("");
+    if !patch_name.is_empty() {
+        msg.push_str(&format!("\nOriginal-patch: {patch_name}\n"));
+    }
     msg
 }
