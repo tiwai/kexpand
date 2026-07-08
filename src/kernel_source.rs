@@ -58,25 +58,49 @@ impl KernelSource {
         crate::series::parse_series(&bytes)
     }
 
-    /// Read all patch blobs for the given series entries using `git cat-file --batch`.
-    /// Sequential packfile access via git's native bulk reader is much faster than
-    /// individual libgit2 object lookups for large numbers of objects.
-    /// Returns (relative_path, raw_bytes) in the same order as `series`.
+    /// Read all patch blobs for the given series entries using parallel sharded
+    /// `git cat-file --batch` processes, one per CPU (capped at 8). Each shard
+    /// inflates a contiguous slice of the series in its own git process, so
+    /// zlib inflate scales across cores. Results are flattened in series order.
     pub fn read_patches(&self, series: &[PathBuf]) -> Result<Vec<(PathBuf, Vec<u8>)>> {
-        use std::io::{BufRead, BufReader, BufWriter, Write};
-        use std::process::{Command, Stdio};
-
         if series.is_empty() {
             return Ok(Vec::new());
         }
 
+        let num_shards = rayon::current_num_threads().min(8).max(1);
+        let chunk_size = series.len().div_ceil(num_shards);
+
         let repo_git_dir = self.repo.path().to_path_buf();
         let tree_oid_str = self.tree_oid.to_string();
 
-        use std::io::Read;
+        let chunks: Vec<&[PathBuf]> = series.chunks(chunk_size).collect();
+
+        use rayon::prelude::*;
+        let shard_results: Vec<Result<Vec<(PathBuf, Vec<u8>)>>> = chunks
+            .into_par_iter()
+            .map(|shard| {
+                Self::read_patches_shard(&repo_git_dir, &tree_oid_str, shard)
+            })
+            .collect();
+
+        let mut results = Vec::with_capacity(series.len());
+        for chunk in shard_results {
+            results.extend(chunk?);
+        }
+        Ok(results)
+    }
+
+    /// Read one contiguous slice of the series via a single `git cat-file --batch`.
+    fn read_patches_shard(
+        repo_git_dir: &Path,
+        tree_oid_str: &str,
+        shard: &[PathBuf],
+    ) -> Result<Vec<(PathBuf, Vec<u8>)>> {
+        use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+        use std::process::{Command, Stdio};
 
         let mut child = Command::new("git")
-            .arg("--git-dir").arg(&repo_git_dir)
+            .arg("--git-dir").arg(repo_git_dir)
             .args(["cat-file", "--batch"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -87,10 +111,9 @@ impl KernelSource {
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
 
-        // Write "<tree>:<path>" specs to stdin in a background thread.
-        // Running concurrently with the read loop below avoids pipe deadlock
-        // when the combined spec data exceeds the kernel pipe buffer.
-        let specs: Vec<String> = series.iter()
+        // Write "<tree>:<path>" specs to stdin in a background thread to avoid
+        // pipe deadlock when the spec data exceeds the OS pipe buffer.
+        let specs: Vec<String> = shard.iter()
             .map(|p| format!("{tree_oid_str}:{}", p.display()))
             .collect();
 
@@ -100,15 +123,14 @@ impl KernelSource {
                 w.write_all(spec.as_bytes())?;
                 w.write_all(b"\n")?;
             }
-            Ok(()) // drop flushes BufWriter, then closes stdin → EOF for git cat-file
+            Ok(())
         });
 
-        // Read blob output: each object is "<oid> <type> <size>\n<content>\n"
         let mut reader = BufReader::with_capacity(1 << 20, stdout);
-        let mut results = Vec::with_capacity(series.len());
+        let mut results = Vec::with_capacity(shard.len());
         let mut header_buf = String::new();
 
-        for path in series {
+        for path in shard {
             header_buf.clear();
             reader.read_line(&mut header_buf).context("reading cat-file header")?;
             let header = header_buf.trim_end();
