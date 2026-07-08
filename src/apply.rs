@@ -24,20 +24,16 @@ pub struct Stats {
     pub skipped_error: usize,
 }
 
-/// Parse all patch files in parallel. Returns one ParsedPatch per series entry.
+/// Parse all patch files in parallel. `entries` is consumed (bytes moved into arena).
 pub fn parse_patches<'a>(
-    series: &[PathBuf],
-    source_dir: &Path,
+    entries: Vec<(PathBuf, Vec<u8>)>,
     arena: &'a ByteArena<'a>,
 ) -> Result<Vec<ParsedPatch<'a>>> {
     use rayon::prelude::*;
 
-    let results: Vec<Result<ParsedPatch<'a>>> = series
-        .par_iter()
-        .map(|rel_path| {
-            let full_path = source_dir.join(rel_path);
-            let bytes = std::fs::read(&full_path)
-                .with_context(|| format!("reading patch {}", full_path.display()))?;
+    let results: Vec<Result<ParsedPatch<'a>>> = entries
+        .into_par_iter()
+        .map(|(rel_path, bytes)| {
             let slice: &'a [u8] = arena.alloc(bytes);
             match parse_patch(slice, 1) {
                 Ok(tp) => {
@@ -208,14 +204,41 @@ pub fn apply_all<'a, W: Write>(
 }
 
 /// Determine the lookup key (for HashMap) and target key (for output).
-/// The lookup key is the OLD filename (what's on disk), target is where the patch puts it.
 fn resolve_paths(file_patch: &TextFilePatch) -> (PathBuf, PathBuf) {
     match (file_patch.old_filename(), file_patch.new_filename()) {
-        (Some(old), Some(new)) => (old.as_ref().to_path_buf(), new.as_ref().to_path_buf()),
-        (Some(old), None) => (old.as_ref().to_path_buf(), old.as_ref().to_path_buf()),
+        (Some(old), Some(new)) if file_patch.is_rename() => {
+            // Rename: look up the old path (stripping any quilt backup suffix),
+            // output goes to the new path.
+            (strip_quilt_backup(old.as_ref()), new.as_ref().to_path_buf())
+        }
+        (Some(_), Some(new)) => {
+            // Regular modify: new_name is always the canonical path.
+            // old_name may carry a backup suffix (~patchname, .orig, .alt …)
+            // added by quilt or patch(1); new_name never has one.
+            let key = new.as_ref().to_path_buf();
+            (key.clone(), key)
+        }
+        (Some(old), None) => {
+            let key = strip_quilt_backup(old.as_ref());
+            (key.clone(), key)
+        }
         (None, Some(new)) => (new.as_ref().to_path_buf(), new.as_ref().to_path_buf()),
         (None, None) => unreachable!("file patch must have at least one filename"),
     }
+}
+
+/// Strip the quilt backup suffix (~patchname) from the final path component.
+/// Used for rename patches where old_name may be "oldfile.c~patchname".
+fn strip_quilt_backup(path: &Path) -> PathBuf {
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        if let Some(tilde) = name.find('~') {
+            if tilde > 0 {
+                let parent = path.parent().unwrap_or(Path::new(""));
+                return parent.join(&name[..tilde]);
+            }
+        }
+    }
+    path.to_path_buf()
 }
 
 fn load_or_create<'a>(

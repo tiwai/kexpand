@@ -49,35 +49,35 @@ The binary is placed at `target/release/kexpand`.
 kexpand [OPTIONS] --output <OUTPUT>
 
 Options:
-  -s, --source <SOURCE>      kernel-source.git checkout
-                             [default: ~/kernel/suse/kernel-source]
-  -l, --linus <LINUS>        Upstream linus git repo (read-only)
-                             [default: ~/git/linus]
-  -o, --output <OUTPUT>      Output git repo to create
-  -b, --branch <BRANCH>      Branch name in the output repo
-                             [default: master]
-  -j, --jobs <JOBS>          Threads for parallel parsing (0 = auto)
-                             [default: 0]
-      --base-tag <BASE_TAG>  Base kernel tag (auto-detected from rpm/config.sh)
-      --max-fuzz <MAX_FUZZ>  Hunk fuzz level [default: 2]
-      --skip-failed          Warn and skip patches that fail to apply
-  -v, --verbose              Print each patch as it is applied
-      --dry-run              Parse and apply in memory without writing git output
-  -h, --help                 Print help
+  -s, --source <SOURCE>    kernel-source.git (bare clone or working tree)
+                           [default: ~/kernel/suse/kernel-source]
+  -b, --branch <BRANCH>   Branch in kernel-source.git to read from;
+                           also used as the output branch name [default: master]
+  -l, --linus <LINUS>     Upstream linus git repo (read-only)
+                           [default: ~/git/linus]
+  -o, --output <OUTPUT>   Output git repo to create
+  -j, --jobs <JOBS>       Threads for parallel parsing (0 = auto) [default: 0]
+      --max-fuzz <FUZZ>   Hunk fuzz level [default: 2]
+      --skip-failed       Warn and skip patches that fail to apply
+  -v, --verbose           Print each patch as it is applied
+      --dry-run           Parse and apply in memory without writing git output
+  -h, --help              Print help
 ```
 
 ### Example
 
 ```sh
 kexpand \
-  --source ~/kernel/suse/sle15-sp7 \
+  --source ~/kernel/suse/kernel-source \
+  --branch SLE15-SP7 \
   --linus  ~/git/linus \
-  --output ~/git/suse-expanded \
-  --branch SLE15-SP7
+  --output ~/git/suse-expanded
 ```
 
-This creates `~/git/suse-expanded` (if it does not exist) with a branch
-`SLE15-SP7` containing one commit per non-guarded patch from `series.conf`.
+This reads `series.conf`, all patch files, and `rpm/config.sh` directly from the
+`SLE15-SP7` branch of `kernel-source.git` (no working-tree checkout needed), then
+creates `~/git/suse-expanded` with a branch `SLE15-SP7` containing one commit per
+non-guarded patch.
 
 The output repo uses git alternates so it shares all upstream objects with the
 linus clone; only the new blobs and commit/tree objects are stored locally.

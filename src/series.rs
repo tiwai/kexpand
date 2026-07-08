@@ -1,7 +1,8 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+
 use anyhow::{Context, Result};
 
-/// Parse series.conf and return the ordered list of patch file paths.
+/// Parse series.conf bytes and return the ordered list of patch file paths.
 ///
 /// Rules:
 /// - Lines starting with `#` (possibly after leading whitespace) → comment, skip
@@ -10,9 +11,8 @@ use anyhow::{Context, Result};
 /// - All other lines: first whitespace-separated token is the patch path (relative to
 ///   kernel-source root); any trailing tokens (e.g. `-p0`) are ignored since we always
 ///   use strip=1 per the project spec.
-pub fn parse_series(path: &Path) -> Result<Vec<PathBuf>> {
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("reading series.conf: {}", path.display()))?;
+pub fn parse_series(data: &[u8]) -> Result<Vec<PathBuf>> {
+    let content = std::str::from_utf8(data).context("series.conf is not UTF-8")?;
     let mut patches = Vec::new();
     for line in content.lines() {
         let trimmed = line.trim_start();
@@ -20,11 +20,9 @@ pub fn parse_series(path: &Path) -> Result<Vec<PathBuf>> {
             continue;
         }
         let first = trimmed.as_bytes()[0];
-        // Comments and guarded lines
         if first == b'#' || first == b'+' || first == b'-' {
             continue;
         }
-        // First whitespace-separated token is the patch path
         let patch_path = trimmed.split_whitespace().next().unwrap();
         patches.push(PathBuf::from(patch_path));
     }
