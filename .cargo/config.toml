@@ -1,0 +1,2 @@
+[build]
+# Use offline mode since we can't write to ~/.cargo
