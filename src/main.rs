@@ -27,7 +27,7 @@ use crate::kernel_source::KernelSource;
 #[command(about = "Expand SUSE kernel-source patches into a git repository")]
 struct Cli {
     /// Path to kernel-source.git (bare clone or working tree)
-    #[arg(short = 's', long, default_value = "/home/tiwai/kernel/suse/kernel-source")]
+    #[arg(short = 's', long, env = "KSOURCE_GIT")]
     source: PathBuf,
 
     /// Branch name in kernel-source.git to read from (also used as output branch name)
@@ -35,7 +35,7 @@ struct Cli {
     branch: String,
 
     /// Path to upstream linus git repo (read-only)
-    #[arg(short = 'l', long, default_value = "/home/tiwai/git/linus")]
+    #[arg(short = 'l', long, env = "LINUX_GIT")]
     linus: PathBuf,
 
     /// Output git repository to create

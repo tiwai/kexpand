@@ -50,11 +50,11 @@ kexpand [OPTIONS] --output <OUTPUT>
 
 Options:
   -s, --source <SOURCE>    kernel-source.git (bare clone or working tree)
-                           [default: ~/kernel/suse/kernel-source]
+                           [$KSOURCE_GIT]
   -b, --branch <BRANCH>   Branch in kernel-source.git to read from;
                            also used as the output branch name [default: master]
   -l, --linus <LINUS>     Upstream linus git repo (read-only)
-                           [default: ~/git/linus]
+                           [$LINUX_GIT]
   -o, --output <OUTPUT>   Output git repo to create
   -j, --jobs <JOBS>       Threads for parallel parsing (0 = auto) [default: 0]
       --max-fuzz <FUZZ>   Hunk fuzz level [default: 2]
@@ -64,13 +64,16 @@ Options:
   -h, --help              Print help
 ```
 
+`-s` and `-l` are required unless the corresponding environment variable is set.
+
 ### Example
 
 ```sh
+export LINUX_GIT=~/git/linus
+export KSOURCE_GIT=~/kernel/suse/kernel-source
+
 kexpand \
-  --source ~/kernel/suse/kernel-source \
   --branch SLE15-SP7 \
-  --linus  ~/git/linus \
   --output ~/git/suse-expanded
 ```
 
