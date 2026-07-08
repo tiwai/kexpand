@@ -35,9 +35,5 @@ impl<'a> ByteArena<'a> {
         slice
     }
 
-    /// Load a file from disk and return its bytes with lifetime `'a`.
-    pub fn load_file(&self, path: &std::path::Path) -> std::io::Result<&'a [u8]> {
-        let bytes = std::fs::read(path)?;
-        Ok(self.alloc(bytes))
-    }
+
 }

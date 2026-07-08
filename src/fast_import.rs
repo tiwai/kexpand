@@ -13,8 +13,6 @@ pub enum Parent {
 /// A reference to a blob in a commit tree entry.
 #[derive(Clone)]
 pub enum BlobRef {
-    /// Blob was emitted in this fast-import stream; reference by mark.
-    Mark(u64),
     /// Blob already exists in the object store (e.g. via alternates); reference by SHA-1.
     Sha1(git2::Oid),
 }
@@ -36,15 +34,6 @@ impl<W: Write> FastImport<W> {
         let m = self.next_mark;
         self.next_mark += 1;
         m
-    }
-
-    /// Emit a blob and return its mark.
-    pub fn emit_blob(&mut self, content: &[u8]) -> Result<u64> {
-        let mark = self.alloc_mark();
-        write!(self.out, "blob\nmark :{mark}\ndata {}\n", content.len())?;
-        self.out.write_all(content)?;
-        self.out.write_all(b"\n")?;
-        Ok(mark)
     }
 
     /// Emit a commit. Returns the commit's mark.
@@ -91,10 +80,8 @@ impl<W: Write> FastImport<W> {
         // File modifications and deletions
         for (path, blob_ref, mode) in modified {
             let path_str = path.to_str().unwrap_or("");
-            match blob_ref {
-                BlobRef::Mark(m) => write!(out, "M {:06o} :{m} {path_str}\n", mode)?,
-                BlobRef::Sha1(oid) => write!(out, "M {:06o} {oid} {path_str}\n", mode)?,
-            }
+            let BlobRef::Sha1(oid) = blob_ref;
+            write!(out, "M {:06o} {oid} {path_str}\n", mode)?;
         }
         for path in deleted {
             let path_str = path.to_str().unwrap_or("");
@@ -103,10 +90,6 @@ impl<W: Write> FastImport<W> {
         out.write_all(b"\n")?;
 
         Ok(mark)
-    }
-
-    pub fn flush(&mut self) -> io::Result<()> {
-        self.out.flush()
     }
 
     /// Write the `done` command and flush. Must be called before dropping

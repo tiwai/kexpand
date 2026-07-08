@@ -86,10 +86,6 @@ impl BlobShardPool {
         Ok((idx, mark))
     }
 
-    pub fn n_shards(&self) -> usize {
-        self.shards.len()
-    }
-
     /// Drop all sender channels simultaneously so all writer threads see EOF at
     /// the same instant → all N fast-import shards drain in parallel.
     /// Waits for writer threads then child processes, reads and deletes marks files.
