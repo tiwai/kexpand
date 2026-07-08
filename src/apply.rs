@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -10,7 +10,6 @@ use libpatch::patch::{PatchDirection, TextFilePatch, TextPatch};
 
 use crate::arena::ByteArena;
 use crate::fast_import::{FastImport, Parent};
-use crate::git_source::GitSource;
 use crate::patch_header::{parse_header, PatchMeta};
 
 pub struct ParsedPatch<'a> {
@@ -52,11 +51,29 @@ pub fn parse_patches<'a>(
     results.into_iter().collect()
 }
 
+/// Collect all unique file lookup-keys referenced by the parsed patches.
+/// These are the paths that need to be pre-loaded from the base git tree.
+pub fn collect_patch_paths(parsed: &[ParsedPatch]) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    for pp in parsed {
+        if let Some(tp) = &pp.text_patch {
+            for fp in &tp.file_patches {
+                let (lookup_key, _) = resolve_paths(fp);
+                seen.insert(lookup_key);
+            }
+        }
+    }
+    seen.into_iter().collect()
+}
+
 /// Apply all parsed patches serially, streaming commits to `fi`.
+/// `modified_files` should be pre-warmed with base file contents.
+/// `mode_map` maps paths to their git tree file modes (0o100644 / 0o100755).
 pub fn apply_all<'a, W: Write>(
     parsed: Vec<ParsedPatch<'a>>,
-    git_source: &GitSource,
-    arena: &'a ByteArena<'a>,
+    base_commit_sha1: &str,
+    mut modified_files: HashMap<PathBuf, ModifiedFile<'a>>,
+    mode_map: HashMap<PathBuf, u32>,
     fi: &mut FastImport<W>,
     branch: &str,
     max_fuzz: usize,
@@ -65,9 +82,8 @@ pub fn apply_all<'a, W: Write>(
     verbose: bool,
 ) -> Result<Stats> {
     let mut stats = Stats { applied: 0, skipped_binary: 0, skipped_error: 0 };
-    let mut modified_files: HashMap<PathBuf, ModifiedFile<'a>> = HashMap::new();
     let mut parent: Option<u64> = None;
-    let base_sha1 = git_source.base_commit_sha1().to_string();
+    let base_sha1 = base_commit_sha1.to_string();
     let analyses = AnalysisSet::default();
 
     for pp in parsed {
@@ -91,10 +107,9 @@ pub fn apply_all<'a, W: Write>(
         for file_patch in &text_patch.file_patches {
             let (lookup_key, _target_key) = resolve_paths(file_patch);
 
-            // Get or load the file
+            // Get or load the file (pre-warmed cache miss fallback)
             if !modified_files.contains_key(&lookup_key) {
-                let mf = load_or_create(git_source, arena, &lookup_key)?;
-                modified_files.insert(lookup_key.clone(), mf);
+                modified_files.insert(lookup_key.clone(), ModifiedFile::new_non_existent());
             }
             let mf = modified_files.get_mut(&lookup_key).unwrap();
 
@@ -158,13 +173,13 @@ pub fn apply_all<'a, W: Write>(
                 let mut content = Vec::new();
                 mf.write_to(&mut content).context("writing file content")?;
 
-                // Determine file mode
+                // Determine file mode from pre-warmed mode map or patch permissions
                 let mode = match &mf.permissions {
                     Some(p) => {
                         use std::os::unix::fs::PermissionsExt;
                         p.mode()
                     }
-                    None => git_source.file_mode(&target),
+                    None => mode_map.get(&target).copied().unwrap_or(0o100644),
                 };
                 // Normalize to 100644 or 100755
                 let mode = if mode & 0o111 != 0 { 0o100755 } else { 0o100644 };
@@ -239,18 +254,4 @@ fn strip_quilt_backup(path: &Path) -> PathBuf {
         }
     }
     path.to_path_buf()
-}
-
-fn load_or_create<'a>(
-    git_source: &GitSource,
-    arena: &'a ByteArena<'a>,
-    path: &Path,
-) -> Result<ModifiedFile<'a>> {
-    match git_source.load_file(path)? {
-        Some(bytes) => {
-            let slice: &'a [u8] = arena.alloc(bytes);
-            Ok(ModifiedFile::new(slice, true, None))
-        }
-        None => Ok(ModifiedFile::new_non_existent()),
-    }
 }

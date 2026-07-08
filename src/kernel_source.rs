@@ -1,7 +1,12 @@
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use git2::{Oid, Repository};
+
+thread_local! {
+    static KS_REPO: RefCell<Option<Repository>> = const { RefCell::new(None) };
+}
 
 /// Reads series.conf, patch files, and rpm/config.sh from a specific branch
 /// of kernel-source.git without requiring a working-tree checkout.
@@ -58,13 +63,36 @@ impl KernelSource {
         crate::series::parse_series(&bytes)
     }
 
-    /// Read all patch blobs for the given series entries.
+    /// Read all patch blobs for the given series entries in parallel.
     /// Returns (relative_path, raw_bytes) in the same order as `series`.
     pub fn read_patches(&self, series: &[PathBuf]) -> Result<Vec<(PathBuf, Vec<u8>)>> {
-        series.iter().map(|p| {
-            let bytes = self.read_blob(p)?
-                .with_context(|| format!("patch not found in branch: {}", p.display()))?;
-            Ok((p.clone(), bytes))
+        use rayon::prelude::*;
+        let repo_path = self.repo.path().to_path_buf();
+        let tree_oid = self.tree_oid;
+
+        series.par_iter().map(|p| -> Result<(PathBuf, Vec<u8>)> {
+            KS_REPO.with(|cell| {
+                let mut guard = cell.borrow_mut();
+                if guard.is_none() {
+                    *guard = Some(Repository::open(&repo_path)
+                        .context("opening kernel-source repo")?);
+                }
+                let repo = guard.as_ref().unwrap();
+                let tree = repo.find_tree(tree_oid).context("finding tree")?;
+                match tree.get_path(p) {
+                    Ok(entry) => {
+                        let obj = entry.to_object(repo)
+                            .with_context(|| format!("reading object '{}'", p.display()))?;
+                        let blob = obj.as_blob()
+                            .ok_or_else(|| anyhow!("'{}' is not a blob", p.display()))?;
+                        Ok((p.clone(), blob.content().to_vec()))
+                    }
+                    Err(e) if e.code() == git2::ErrorCode::NotFound =>
+                        bail!("patch not found in branch: {}", p.display()),
+                    Err(e) =>
+                        Err(e).with_context(|| format!("looking up '{}'", p.display())),
+                }
+            })
         }).collect()
     }
 }

@@ -6,14 +6,16 @@ mod kernel_source;
 mod patch_header;
 mod series;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
+use libpatch::modified_file::ModifiedFile;
 
-use crate::apply::{apply_all, parse_patches};
+use crate::apply::{apply_all, collect_patch_paths, parse_patches};
 use crate::arena::ByteArena;
 use crate::fast_import::FastImport;
 use crate::git_source::GitSource;
@@ -38,7 +40,7 @@ struct Cli {
     #[arg(short = 'o', long)]
     output: PathBuf,
 
-    /// Number of threads for parallel parsing (0 = auto)
+    /// Number of threads for parallel processing (0 = auto)
     #[arg(short = 'j', long, default_value = "0")]
     jobs: usize,
 
@@ -89,7 +91,7 @@ fn main() -> Result<()> {
 
     let arena = ByteArena::new();
 
-    // Read all patch blobs from the branch (serial git2 access)
+    // Read all patch blobs from the branch (parallel git2 access)
     let t0 = Instant::now();
     println!("Reading patches...");
     let patch_entries = ks.read_patches(&series)?;
@@ -104,6 +106,24 @@ fn main() -> Result<()> {
     // Open the linus git source
     let git_source = GitSource::new(&cli.linus, &base_tag)?;
     println!("Base commit: {}", git_source.base_commit_sha1());
+
+    // Pre-warm: load all base-tree files touched by patches in parallel
+    let t_pw = Instant::now();
+    println!("Pre-loading source files...");
+    let touched_paths = collect_patch_paths(&parsed);
+    let prewarmed = git_source.prewarm_files(&touched_paths)
+        .context("pre-warming file cache")?;
+    let mut pre_files: HashMap<PathBuf, ModifiedFile> = HashMap::with_capacity(prewarmed.len());
+    let mut mode_map: HashMap<PathBuf, u32> = HashMap::with_capacity(prewarmed.len());
+    for (path, content, mode) in prewarmed {
+        let mf = match content {
+            Some(bytes) => ModifiedFile::new(arena.alloc(bytes), true, None),
+            None => ModifiedFile::new_non_existent(),
+        };
+        pre_files.insert(path.clone(), mf);
+        mode_map.insert(path, mode);
+    }
+    println!("Pre-loaded {} files in {:.1}s", pre_files.len(), t_pw.elapsed().as_secs_f64());
 
     let committer_timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -133,8 +153,9 @@ fn main() -> Result<()> {
     println!("Applying patches...");
     let stats = apply_all(
         parsed,
-        &git_source,
-        &arena,
+        git_source.base_commit_sha1(),
+        pre_files,
+        mode_map,
         &mut fi,
         &cli.branch,
         cli.max_fuzz,

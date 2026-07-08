@@ -1,6 +1,11 @@
-use std::path::Path;
+use std::cell::RefCell;
+use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Context, Result};
 use git2::{Oid, Repository};
+
+thread_local! {
+    static GS_REPO: RefCell<Option<Repository>> = const { RefCell::new(None) };
+}
 
 pub struct GitSource {
     repo: Repository,
@@ -29,30 +34,38 @@ impl GitSource {
         &self.commit_sha1
     }
 
-    /// Lazily load a file's content from the git tree. Returns the raw bytes.
-    /// Returns `None` if the path doesn't exist in the tree (new file created by patches).
-    pub fn load_file(&self, path: &Path) -> Result<Option<Vec<u8>>> {
-        let tree = self.repo.find_tree(self.tree_oid)
-            .context("finding base tree")?;
+    /// Load content and file mode for a batch of paths in parallel.
+    /// Returns (path, content_or_none, mode) for each input path.
+    /// Paths not found in the tree return (path, None, 0o100644).
+    pub fn prewarm_files(&self, paths: &[PathBuf]) -> Result<Vec<(PathBuf, Option<Vec<u8>>, u32)>> {
+        use rayon::prelude::*;
+        let repo_path = self.repo.path().to_path_buf();
+        let tree_oid = self.tree_oid;
 
-        match tree.get_path(path) {
-            Ok(entry) => {
-                let obj = entry.to_object(&self.repo)
-                    .with_context(|| format!("getting object for '{}'", path.display()))?;
-                let blob = obj.as_blob()
-                    .ok_or_else(|| anyhow!("'{}' is not a blob", path.display()))?;
-                Ok(Some(blob.content().to_vec()))
-            }
-            Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(None),
-            Err(e) => Err(e).with_context(|| format!("looking up '{}'", path.display())),
-        }
-    }
-
-    /// Get the file mode (permissions) from the git tree entry.
-    /// Returns 0o100644 if not found or not a regular file.
-    pub fn file_mode(&self, path: &Path) -> u32 {
-        let Ok(tree) = self.repo.find_tree(self.tree_oid) else { return 0o100644 };
-        let Ok(entry) = tree.get_path(path) else { return 0o100644 };
-        entry.filemode() as u32
+        paths.par_iter().map(|path| -> Result<(PathBuf, Option<Vec<u8>>, u32)> {
+            GS_REPO.with(|cell| {
+                let mut guard = cell.borrow_mut();
+                if guard.is_none() {
+                    *guard = Some(Repository::open(&repo_path)
+                        .context("opening linus repo")?);
+                }
+                let repo = guard.as_ref().unwrap();
+                let tree = repo.find_tree(tree_oid).context("finding base tree")?;
+                match tree.get_path(path) {
+                    Ok(entry) => {
+                        let mode = entry.filemode() as u32;
+                        let obj = entry.to_object(repo)
+                            .with_context(|| format!("getting object for '{}'", path.display()))?;
+                        let blob = obj.as_blob()
+                            .ok_or_else(|| anyhow!("'{}' is not a blob", path.display()))?;
+                        Ok((path.clone(), Some(blob.content().to_vec()), mode))
+                    }
+                    Err(e) if e.code() == git2::ErrorCode::NotFound =>
+                        Ok((path.clone(), None, 0o100644)),
+                    Err(e) =>
+                        Err(e).with_context(|| format!("looking up '{}'", path.display())),
+                }
+            })
+        }).collect()
     }
 }
