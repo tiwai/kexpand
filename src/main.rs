@@ -183,7 +183,7 @@ fn main() -> Result<()> {
     let t_commits = Instant::now();
     println!("Emitting commits...");
     let mut commit_child = Command::new("git")
-        .args(["-c", "pack.compression=0", "fast-import", "--done"])
+        .args(["-c", "pack.compression=0", "fast-import", "--done", "--force"])
         .current_dir(&cli.output)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
