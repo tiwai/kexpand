@@ -55,7 +55,7 @@ Options:
                              [default: ~/git/linus]
   -o, --output <OUTPUT>      Output git repo to create
   -b, --branch <BRANCH>      Branch name in the output repo
-                             [default: suse/expand]
+                             [default: expand]
   -j, --jobs <JOBS>          Threads for parallel parsing (0 = auto)
                              [default: 0]
       --base-tag <BASE_TAG>  Base kernel tag (auto-detected from rpm/config.sh)
@@ -73,11 +73,11 @@ kexpand \
   --source ~/kernel/suse/sle15-sp7 \
   --linus  ~/git/linus \
   --output ~/git/suse-expanded \
-  --branch suse/SLE15-SP7
+  --branch SLE15-SP7
 ```
 
 This creates `~/git/suse-expanded` (if it does not exist) with a branch
-`suse/SLE15-SP7` containing one commit per non-guarded patch from `series.conf`.
+`SLE15-SP7` containing one commit per non-guarded patch from `series.conf`.
 
 The output repo uses git alternates so it shares all upstream objects with the
 linus clone; only the new blobs and commit/tree objects are stored locally.
