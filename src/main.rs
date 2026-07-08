@@ -1,5 +1,6 @@
 mod arena;
 mod apply;
+mod blob_shards;
 mod fast_import;
 mod git_source;
 mod kernel_source;
@@ -7,7 +8,7 @@ mod patch_header;
 mod series;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
@@ -15,9 +16,10 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use libpatch::modified_file::ModifiedFile;
 
-use crate::apply::{apply_all, collect_patch_paths, parse_patches};
+use crate::apply::{apply_blobs, collect_patch_paths, parse_patches, BlobMark, PatchResult};
 use crate::arena::ByteArena;
-use crate::fast_import::FastImport;
+use crate::blob_shards::BlobShardPool;
+use crate::fast_import::{BlobRef, FastImport, Parent};
 use crate::git_source::GitSource;
 use crate::kernel_source::KernelSource;
 
@@ -67,6 +69,10 @@ struct Cli {
     /// Threads for `git repack` (0 = auto)
     #[arg(long, default_value = "0")]
     repack_threads: usize,
+
+    /// Number of parallel blob-shard fast-import processes (0 = auto)
+    #[arg(long, default_value = "0")]
+    blob_shards: usize,
 }
 
 fn main() -> Result<()> {
@@ -143,49 +149,64 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Spawn git fast-import with compression disabled; a parallel repack at the
-    // end will delta-compress and zlib-compress everything on multiple cores,
-    // which is much faster than fast-import's single-threaded zlib path.
-    let mut child = Command::new("git")
+    // Resolve shard count
+    let n_shards = if cli.blob_shards == 0 {
+        std::thread::available_parallelism().map_or(8, |n| n.get().min(16))
+    } else {
+        cli.blob_shards
+    };
+    println!("Blob shards: {n_shards}");
+
+    // Phase 1: apply patches, push blobs to shard writer threads
+    let mut shard_pool = BlobShardPool::new(&cli.output, n_shards)?;
+    let t_apply = Instant::now();
+    println!("Applying patches...");
+    let (patch_results, stats) = apply_blobs(
+        parsed,
+        pre_files,
+        mode_map,
+        &git_source,
+        &mut shard_pool,
+        cli.max_fuzz,
+        cli.skip_failed,
+        cli.verbose,
+    )?;
+    println!("Applied {} patches in {:.1}s", stats.applied, t_apply.elapsed().as_secs_f64());
+
+    // Phase 2: drain all shard fast-imports in parallel, collect mark→SHA-1 maps
+    let t_drain = Instant::now();
+    println!("Draining blob shards...");
+    let mark_maps = shard_pool.finish_and_read_marks()?;
+    println!("Blob shards drained in {:.1}s", t_drain.elapsed().as_secs_f64());
+
+    // Phase 3: emit commits (no blob data, just commit metadata + SHA-1 blob refs)
+    let t_commits = Instant::now();
+    println!("Emitting commits...");
+    let mut commit_child = Command::new("git")
         .args(["-c", "pack.compression=0", "fast-import", "--done"])
         .current_dir(&cli.output)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
         .spawn()
-        .context("spawning git fast-import")?;
-
-    let stdin = child.stdin.take().unwrap();
-    let mut fi = FastImport::new(stdin);
-
-    // Apply all patches
-    let t_apply = Instant::now();
-    println!("Applying patches...");
-    let stats = apply_all(
-        parsed,
-        git_source.base_commit_sha1(),
-        pre_files,
-        mode_map,
+        .context("spawning commit fast-import")?;
+    let commit_stdin = commit_child.stdin.take().unwrap();
+    let mut fi = FastImport::new(commit_stdin);
+    emit_commits(
         &mut fi,
+        &patch_results,
+        &mark_maps,
+        git_source.base_commit_sha1(),
         &cli.branch,
-        cli.max_fuzz,
-        cli.skip_failed,
         committer_timestamp,
-        cli.verbose,
     )?;
-    println!("Applied {} patches in {:.1}s", stats.applied, t_apply.elapsed().as_secs_f64());
-
-    // Signal git fast-import we're done (required by --done flag)
-    fi.done().context("sending done to git fast-import")?;
+    fi.done().context("sending done to commit fast-import")?;
     drop(fi);
-
-    // Wait for git fast-import to finish
-    let t_drain = Instant::now();
-    let status = child.wait().context("waiting for git fast-import")?;
+    let status = commit_child.wait().context("waiting for commit fast-import")?;
     if !status.success() {
-        bail!("git fast-import failed with exit code {:?}", status.code());
+        bail!("commit fast-import failed with {status}");
     }
-    println!("git fast-import drained in {:.1}s", t_drain.elapsed().as_secs_f64());
+    println!("Commits emitted in {:.1}s", t_commits.elapsed().as_secs_f64());
 
     println!(
         "{} commits, {} binary skipped, {} failed skipped",
@@ -197,6 +218,45 @@ fn main() -> Result<()> {
         println!("Repacking...");
         run_repack(&cli.output, cli.repack_threads)?;
         println!("Repack done in {:.1}s", t_repack.elapsed().as_secs_f64());
+    }
+
+    Ok(())
+}
+
+fn emit_commits<W: std::io::Write>(
+    fi: &mut FastImport<W>,
+    results: &[PatchResult],
+    mark_maps: &[HashMap<u64, git2::Oid>],
+    base_commit_sha1: &str,
+    branch: &str,
+    committer_timestamp: i64,
+) -> Result<()> {
+    let mut parent_mark: Option<u64> = None;
+
+    for result in results {
+        let modified: Vec<(&Path, BlobRef, u32)> = result.blobs.iter()
+            .map(|e| -> Result<(&Path, BlobRef, u32)> {
+                let br = match &e.blob_mark {
+                    BlobMark::Alternates(oid) => BlobRef::Sha1(*oid),
+                    BlobMark::Shard(idx, mark) => {
+                        let oid = mark_maps[*idx].get(mark)
+                            .with_context(|| format!("shard {idx} mark :{mark} missing from marks file"))?;
+                        BlobRef::Sha1(*oid)
+                    }
+                };
+                Ok((e.path.as_path(), br, e.mode))
+            })
+            .collect::<Result<_>>()?;
+
+        let deleted: Vec<&Path> = result.deleted.iter().map(|p| p.as_path()).collect();
+
+        let parent = match parent_mark {
+            None => Parent::BaseSha1(base_commit_sha1.to_string()),
+            Some(m) => Parent::Mark(m),
+        };
+
+        let cm = fi.emit_commit(&result.meta, branch, parent, committer_timestamp, &modified, &deleted)?;
+        parent_mark = Some(cm);
     }
 
     Ok(())
@@ -227,10 +287,6 @@ fn run_repack(output: &std::path::Path, threads: usize) -> Result<()> {
         return Ok(());
     }
 
-    // Use pack-objects to enumerate all objects from the existing idx files
-    // and write a new, compressed+delta pack.  This never touches alternates.
-    // Path is relative to current_dir(output) — must NOT use pack_dir (which
-    // may itself be a relative path, causing double-prefixing).
     let pack_base = std::path::Path::new(".git/objects/pack/pack");
     let mut po = Command::new("git")
         .args([
@@ -251,7 +307,6 @@ fn run_repack(output: &std::path::Path, threads: usize) -> Result<()> {
     let po_stdout = po.stdout.take().unwrap();
 
     // Write all object SHAs from every existing idx to pack-objects stdin.
-    // Run in a thread to avoid deadlock if pack-objects buffers stdout.
     let idx_files_clone = idx_files.clone();
     let output_owned = output.to_path_buf();
     let write_handle = std::thread::spawn(move || -> Result<()> {
@@ -280,7 +335,6 @@ fn run_repack(output: &std::path::Path, threads: usize) -> Result<()> {
         Ok(())
     });
 
-    // Read the new pack SHA that pack-objects prints to stdout.
     let mut new_sha = String::new();
     BufReader::new(po_stdout).read_line(&mut new_sha).context("reading pack-objects output")?;
     let new_sha = new_sha.trim().to_string();
@@ -300,7 +354,6 @@ fn run_repack(output: &std::path::Path, threads: usize) -> Result<()> {
             .with_context(|| format!("removing old idx {}", idx.display()))?;
     }
 
-    // Update the pack-file index so git finds the new pack.
     let new_pack = pack_dir.join(format!("pack-{new_sha}.pack"));
     let new_idx  = pack_dir.join(format!("pack-{new_sha}.idx"));
     if !new_pack.exists() || !new_idx.exists() {

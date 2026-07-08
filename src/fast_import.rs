@@ -10,6 +10,15 @@ pub enum Parent {
     Mark(u64),
 }
 
+/// A reference to a blob in a commit tree entry.
+#[derive(Clone)]
+pub enum BlobRef {
+    /// Blob was emitted in this fast-import stream; reference by mark.
+    Mark(u64),
+    /// Blob already exists in the object store (e.g. via alternates); reference by SHA-1.
+    Sha1(git2::Oid),
+}
+
 pub struct FastImport<W: Write> {
     out: BufWriter<W>,
     next_mark: u64,
@@ -40,7 +49,7 @@ impl<W: Write> FastImport<W> {
 
     /// Emit a commit. Returns the commit's mark.
     ///
-    /// `modified`: (path, blob_mark, mode) for each added/modified file.
+    /// `modified`: (path, blob_ref, mode) for each added/modified file.
     /// `deleted`:  paths to delete in this commit.
     pub fn emit_commit(
         &mut self,
@@ -48,7 +57,7 @@ impl<W: Write> FastImport<W> {
         branch: &str,
         parent: Parent,
         committer_timestamp: i64,
-        modified: &[(&Path, u64, u32)],
+        modified: &[(&Path, BlobRef, u32)],
         deleted: &[&Path],
     ) -> Result<u64> {
         let mark = self.alloc_mark();
@@ -80,9 +89,12 @@ impl<W: Write> FastImport<W> {
         }
 
         // File modifications and deletions
-        for (path, blob_mark, mode) in modified {
+        for (path, blob_ref, mode) in modified {
             let path_str = path.to_str().unwrap_or("");
-            write!(out, "M {:06o} :{blob_mark} {path_str}\n", mode)?;
+            match blob_ref {
+                BlobRef::Mark(m) => write!(out, "M {:06o} :{m} {path_str}\n", mode)?,
+                BlobRef::Sha1(oid) => write!(out, "M {:06o} {oid} {path_str}\n", mode)?,
+            }
         }
         for path in deleted {
             let path_str = path.to_str().unwrap_or("");

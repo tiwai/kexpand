@@ -14,6 +14,11 @@ libpatch = { package = "rapidquilt", path = "/home/tiwai/git/misc/rapidquilt" }
 git2 = "=0.21.0"
 rayon = "=1.12.0"
 anyhow = "=1.0.103"
+openssl = "0.10"
 clap = { version = "=4.6.1", features = ["derive"] }
 chrono = "=0.4.45"
 memchr = "=2.8.2"
+
+[profile.profiling]
+inherits = "release"
+debug = true
