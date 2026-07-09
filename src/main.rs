@@ -63,7 +63,7 @@ struct Cli {
     quiet: bool,
 
     /// Skip the final `git repack` step (leaves loose/uncompressed packs)
-    #[arg(long)]
+    #[arg(short = 'R', long)]
     no_repack: bool,
 
     /// Threads for `git repack` (0 = auto)
