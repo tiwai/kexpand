@@ -10,7 +10,7 @@ lto = true
 opt-level = 3
 
 [dependencies]
-libpatch = { package = "rapidquilt", path = "/home/tiwai/git/misc/rapidquilt" }
+libpatch = { package = "rapidquilt", path = "rapidquilt" }
 git2 = "=0.21.0"
 rayon = "=1.12.0"
 anyhow = "=1.0.103"

@@ -1,0 +1,3 @@
+[submodule "rapidquilt"]
+	path = rapidquilt
+	url = https://github.com/openSUSE/rapidquilt
