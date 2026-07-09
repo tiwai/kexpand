@@ -34,7 +34,7 @@ slow for a large series.
 ## Prerequisites
 
 - Rust toolchain (edition 2021)
-- A clone of [linus/linux](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git)
+- A clone of [torvalds/linux](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git)
   (read-only access is sufficient)
 - A checkout of SUSE's kernel-source.git at the branch you want to expand
 
@@ -52,12 +52,14 @@ The binary is placed at `target/release/kexpand`.
 branch you want to expand must be checked out there).
 
 ```
-kexpand [OPTIONS] --linus <LINUS> --output <OUTPUT>
+kexpand [OPTIONS] <OUTPUT>
+
+Arguments:
+  <OUTPUT>                Output git repo to create
 
 Options:
   -b, --branch <BRANCH>   Output branch name in the destination repo [default: master]
-  -l, --linus <LINUS>     Upstream linus git repo (read-only) [$LINUX_GIT]
-  -o, --output <OUTPUT>   Output git repo to create
+  -l, --linux <LINUX>     Upstream linux git repo (read-only) [$LINUX_GIT]
   -j, --jobs <JOBS>       Threads for parallel parsing (0 = auto) [default: 0]
       --max-fuzz <FUZZ>   Hunk fuzz level [default: 2]
       --skip-failed       Warn and skip patches that fail to apply
@@ -75,8 +77,8 @@ cd ~/kernel/suse/kernel-source
 git checkout SLE15-SP7
 
 kexpand \
-  --linus ~/git/linus \
-  --output ~/git/suse-expanded \
+  --linux ~/git/linux \
+  ~/git/suse-expanded \
   --branch SLE15-SP7
 ```
 
@@ -85,7 +87,7 @@ working tree, then creates `~/git/suse-expanded` with a branch `SLE15-SP7`
 containing one commit per non-guarded patch.
 
 The output repo uses git alternates so it shares all upstream objects with the
-linus clone; only the new blobs and commit/tree objects are stored locally.
+linux clone; only the new blobs and commit/tree objects are stored locally.
 
 ## How series.conf guards work
 
