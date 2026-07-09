@@ -58,6 +58,10 @@ struct Cli {
     #[arg(long)]
     dry_run: bool,
 
+    /// Suppress progress output
+    #[arg(short = 'q', long)]
+    quiet: bool,
+
     /// Skip the final `git repack` step (leaves loose/uncompressed packs)
     #[arg(long)]
     no_repack: bool,
@@ -90,37 +94,37 @@ fn main() -> Result<()> {
 
     // Detect base tag from rpm/config.sh
     let base_tag = ks.base_tag()?;
-    println!("Base tag: {}", base_tag);
+    if !cli.quiet { println!("Base tag: {}", base_tag); }
 
     // Parse series.conf
     let series = ks.series()?;
-    println!("Patches to apply: {}", series.len());
+    if !cli.quiet { println!("Patches to apply: {}", series.len()); }
 
     // Set up output repo
     if !cli.dry_run {
-        init_output_repo(&cli.output, &linux)?;
+        init_output_repo(&cli.output, &linux, cli.quiet)?;
     }
 
     let arena = ByteArena::new();
 
     let t0 = Instant::now();
-    println!("Reading patches...");
+    if !cli.quiet { println!("Reading patches..."); }
     let patch_entries = ks.read_patches(&series)?;
-    println!("Read {} patches in {:.1}s", patch_entries.len(), t0.elapsed().as_secs_f64());
+    if !cli.quiet { println!("Read {} patches in {:.1}s", patch_entries.len(), t0.elapsed().as_secs_f64()); }
 
     // Parse patches in parallel
     let t1 = Instant::now();
-    println!("Parsing patches...");
+    if !cli.quiet { println!("Parsing patches..."); }
     let parsed = parse_patches(patch_entries, &arena)?;
-    println!("Parsed {} patches in {:.1}s", parsed.len(), t1.elapsed().as_secs_f64());
+    if !cli.quiet { println!("Parsed {} patches in {:.1}s", parsed.len(), t1.elapsed().as_secs_f64()); }
 
     // Open the linux git source
     let git_source = GitSource::new(&linux, &base_tag)?;
-    println!("Base commit: {}", git_source.base_commit_sha1());
+    if !cli.quiet { println!("Base commit: {}", git_source.base_commit_sha1()); }
 
     // Pre-warm: load all base-tree files touched by patches in parallel
     let t_pw = Instant::now();
-    println!("Pre-loading source files...");
+    if !cli.quiet { println!("Pre-loading source files..."); }
     let touched_paths = collect_patch_paths(&parsed);
     let prewarmed = git_source.prewarm_files(&touched_paths)
         .context("pre-warming file cache")?;
@@ -134,7 +138,7 @@ fn main() -> Result<()> {
         pre_files.insert(path.clone(), mf);
         mode_map.insert(path, mode);
     }
-    println!("Pre-loaded {} files in {:.1}s", pre_files.len(), t_pw.elapsed().as_secs_f64());
+    if !cli.quiet { println!("Pre-loaded {} files in {:.1}s", pre_files.len(), t_pw.elapsed().as_secs_f64()); }
 
     let committer_timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -142,7 +146,7 @@ fn main() -> Result<()> {
         .as_secs() as i64;
 
     if cli.dry_run {
-        println!("--dry-run: skipping git output");
+        if !cli.quiet { println!("--dry-run: skipping git output"); }
         return Ok(());
     }
 
@@ -152,12 +156,12 @@ fn main() -> Result<()> {
     } else {
         cli.blob_shards
     };
-    println!("Blob shards: {n_shards}");
+    if !cli.quiet { println!("Blob shards: {n_shards}"); }
 
     // Phase 1: apply patches, push blobs to shard writer threads
     let mut shard_pool = BlobShardPool::new(&cli.output, n_shards)?;
     let t_apply = Instant::now();
-    println!("Applying patches...");
+    if !cli.quiet { println!("Applying patches..."); }
     let (patch_results, stats) = apply_blobs(
         parsed,
         pre_files,
@@ -167,24 +171,25 @@ fn main() -> Result<()> {
         cli.max_fuzz,
         cli.skip_failed,
         cli.verbose,
+        cli.quiet,
     )?;
-    println!("Applied {} patches in {:.1}s", stats.applied, t_apply.elapsed().as_secs_f64());
+    if !cli.quiet { println!("Applied {} patches in {:.1}s", stats.applied, t_apply.elapsed().as_secs_f64()); }
 
     // Phase 2: drain all shard fast-imports in parallel, collect mark→SHA-1 maps
     let t_drain = Instant::now();
-    println!("Draining blob shards...");
+    if !cli.quiet { println!("Draining blob shards..."); }
     let mark_maps = shard_pool.finish_and_read_marks()?;
-    println!("Blob shards drained in {:.1}s", t_drain.elapsed().as_secs_f64());
+    if !cli.quiet { println!("Blob shards drained in {:.1}s", t_drain.elapsed().as_secs_f64()); }
 
     // Phase 3: emit commits (no blob data, just commit metadata + SHA-1 blob refs)
     let t_commits = Instant::now();
-    println!("Emitting commits...");
+    if !cli.quiet { println!("Emitting commits..."); }
     let mut commit_child = Command::new("git")
         .args(["-c", "pack.compression=0", "fast-import", "--done", "--force"])
         .current_dir(&cli.output)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
+        .stderr(if cli.quiet { Stdio::null() } else { Stdio::inherit() })
         .spawn()
         .context("spawning commit fast-import")?;
     let commit_stdin = commit_child.stdin.take().unwrap();
@@ -203,18 +208,20 @@ fn main() -> Result<()> {
     if !status.success() {
         bail!("commit fast-import failed with {status}");
     }
-    println!("Commits emitted in {:.1}s", t_commits.elapsed().as_secs_f64());
+    if !cli.quiet { println!("Commits emitted in {:.1}s", t_commits.elapsed().as_secs_f64()); }
 
-    println!(
-        "{} commits, {} binary skipped, {} failed skipped",
-        stats.applied, stats.skipped_binary, stats.skipped_error
-    );
+    if !cli.quiet {
+        println!(
+            "{} commits, {} binary skipped, {} failed skipped",
+            stats.applied, stats.skipped_binary, stats.skipped_error
+        );
+    }
 
     if !cli.no_repack {
         let t_repack = Instant::now();
-        println!("Repacking...");
+        if !cli.quiet { println!("Repacking..."); }
         run_repack(&cli.output, cli.repack_threads)?;
-        println!("Repack done in {:.1}s", t_repack.elapsed().as_secs_f64());
+        if !cli.quiet { println!("Repack done in {:.1}s", t_repack.elapsed().as_secs_f64()); }
     }
 
     Ok(())
@@ -361,9 +368,9 @@ fn run_repack(output: &std::path::Path, threads: usize) -> Result<()> {
 }
 
 /// Initialize the output git repo with alternates pointing to linux objects.
-fn init_output_repo(output: &std::path::Path, linux: &std::path::Path) -> Result<()> {
+fn init_output_repo(output: &std::path::Path, linux: &std::path::Path, quiet: bool) -> Result<()> {
     if output.exists() {
-        println!("Output repo exists, using it");
+        if !quiet { println!("Output repo exists, using it"); }
         return Ok(());
     }
 
@@ -386,6 +393,6 @@ fn init_output_repo(output: &std::path::Path, linux: &std::path::Path) -> Result
         format!("{}\n", linux_objects.display()),
     ).context("writing alternates")?;
 
-    println!("Initialized output repo at {}", output.display());
+    if !quiet { println!("Initialized output repo at {}", output.display()); }
     Ok(())
 }

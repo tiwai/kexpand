@@ -124,6 +124,7 @@ pub fn apply_blobs<'a>(
     max_fuzz: usize,
     skip_failed: bool,
     verbose: bool,
+    quiet: bool,
 ) -> Result<(Vec<PatchResult>, Stats)> {
     let mut stats = Stats { applied: 0, skipped_binary: 0, skipped_error: 0 };
     let mut results: Vec<PatchResult> = Vec::new();
@@ -264,11 +265,13 @@ pub fn apply_blobs<'a>(
         stats.applied += 1;
     }
 
-    eprintln!(
-        "  apply timing: write_to={:.1}s  sha1={:.1}s  odb={:.1}s  shard_send={:.1}s  alternates={n_alternates}  deduped={n_deduped}",
-        t_write_to.as_secs_f64(), t_sha1.as_secs_f64(),
-        t_odb.as_secs_f64(), t_shard.as_secs_f64()
-    );
+    if !quiet {
+        eprintln!(
+            "  apply timing: write_to={:.1}s  sha1={:.1}s  odb={:.1}s  shard_send={:.1}s  alternates={n_alternates}  deduped={n_deduped}",
+            t_write_to.as_secs_f64(), t_sha1.as_secs_f64(),
+            t_odb.as_secs_f64(), t_shard.as_secs_f64()
+        );
+    }
 
     Ok((results, stats))
 }
