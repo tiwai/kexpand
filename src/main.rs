@@ -16,7 +16,7 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use libpatch::modified_file::ModifiedFile;
 
-use crate::apply::{apply_blobs, collect_patch_paths, parse_patches, BlobMark, PatchResult};
+use crate::apply::{apply_blobs, apply_blobs_one_shot, collect_patch_paths, parse_patches, BlobMark, PatchResult};
 use crate::arena::ByteArena;
 use crate::blob_shards::BlobShardPool;
 use crate::fast_import::{BlobRef, FastImport, Parent};
@@ -73,6 +73,10 @@ struct Cli {
     /// Number of parallel blob-shard fast-import processes (0 = auto)
     #[arg(long, default_value = "0")]
     blob_shards: usize,
+
+    /// Squash all patches into a single commit instead of one commit per patch
+    #[arg(short = '1', long)]
+    one_shot: bool,
 }
 
 fn main() -> Result<()> {
@@ -162,17 +166,33 @@ fn main() -> Result<()> {
     let mut shard_pool = BlobShardPool::new(&cli.output, n_shards)?;
     let t_apply = Instant::now();
     if !cli.quiet { println!("Applying patches..."); }
-    let (patch_results, stats) = apply_blobs(
-        parsed,
-        pre_files,
-        mode_map,
-        &git_source,
-        &mut shard_pool,
-        cli.max_fuzz,
-        cli.skip_failed,
-        cli.verbose,
-        cli.quiet,
-    )?;
+    let (patch_results, stats) = if cli.one_shot {
+        let (mut result, stats) = apply_blobs_one_shot(
+            parsed,
+            pre_files,
+            mode_map,
+            &git_source,
+            &mut shard_pool,
+            cli.max_fuzz,
+            cli.skip_failed,
+            cli.verbose,
+            cli.quiet,
+        )?;
+        result.meta.author_timestamp = committer_timestamp;
+        (vec![result], stats)
+    } else {
+        apply_blobs(
+            parsed,
+            pre_files,
+            mode_map,
+            &git_source,
+            &mut shard_pool,
+            cli.max_fuzz,
+            cli.skip_failed,
+            cli.verbose,
+            cli.quiet,
+        )?
+    };
     if !cli.quiet { println!("Applied {} patches in {:.1}s", stats.applied, t_apply.elapsed().as_secs_f64()); }
 
     // Phase 2: drain all shard fast-imports in parallel, collect mark→SHA-1 maps

@@ -276,6 +276,171 @@ pub fn apply_blobs<'a>(
     Ok((results, stats))
 }
 
+/// Apply all patches and squash into a single commit (one-shot mode).
+/// Only blobs for the final state of each touched file are emitted.
+pub fn apply_blobs_one_shot<'a>(
+    parsed: Vec<ParsedPatch<'a>>,
+    mut modified_files: HashMap<PathBuf, ModifiedFile<'a>>,
+    mode_map: HashMap<PathBuf, u32>,
+    git_source: &GitSource,
+    shard_pool: &mut BlobShardPool,
+    max_fuzz: usize,
+    skip_failed: bool,
+    verbose: bool,
+    quiet: bool,
+) -> Result<(PatchResult, Stats)> {
+    use crate::patch_header::PatchMeta;
+
+    let mut stats = Stats { applied: 0, skipped_binary: 0, skipped_error: 0 };
+    let analyses = AnalysisSet::default();
+
+    let mut touched_paths: HashSet<PathBuf> = HashSet::new();
+    let mut rename_sources: HashSet<PathBuf> = HashSet::new();
+
+    // Apply all patches, tracking which paths end up changed
+    for pp in parsed {
+        let text_patch = match pp.text_patch {
+            None => {
+                eprintln!("SKIP (binary): {}", pp.meta.source_path.display());
+                stats.skipped_binary += 1;
+                continue;
+            }
+            Some(tp) => tp,
+        };
+
+        if verbose {
+            println!("  applying: {}", pp.meta.source_path.display());
+        }
+
+        let mut patch_failed = false;
+
+        for file_patch in &text_patch.file_patches {
+            let (lookup_key, _target_key) = resolve_paths(file_patch);
+
+            if !modified_files.contains_key(&lookup_key) {
+                modified_files.insert(lookup_key.clone(), ModifiedFile::new_non_existent());
+            }
+            let mf = modified_files.get_mut(&lookup_key).unwrap();
+
+            let report = file_patch.apply(mf, PatchDirection::Forward, max_fuzz,
+                                           &analyses, &fn_analysis_note_noop);
+            if report.failed() {
+                if skip_failed {
+                    eprintln!("WARN: hunk failed in {} (patch {})",
+                        lookup_key.display(), pp.meta.source_path.display());
+                    patch_failed = true;
+                } else {
+                    bail!("hunk failed in '{}' while applying patch '{}'",
+                        lookup_key.display(), pp.meta.source_path.display());
+                }
+            }
+
+            if file_patch.is_rename() {
+                if let Some(new_fn) = file_patch.new_filename() {
+                    let new_key = new_fn.as_ref().to_path_buf();
+                    let mf_entry = modified_files.get_mut(&lookup_key).unwrap();
+                    let moved = mf_entry.move_out();
+                    rename_sources.insert(lookup_key.clone());
+                    touched_paths.remove(&lookup_key);
+                    modified_files.insert(new_key.clone(), moved);
+                    touched_paths.insert(new_key);
+                }
+            } else {
+                touched_paths.insert(lookup_key);
+            }
+        }
+
+        if patch_failed {
+            stats.skipped_error += 1;
+        } else {
+            stats.applied += 1;
+        }
+    }
+
+    // Emit blobs for the final state of all touched paths
+    let mut blob_cache: HashMap<git2::Oid, BlobMark> = HashMap::new();
+    let mut blobs: Vec<BlobEntry> = Vec::new();
+    let mut deleted: Vec<PathBuf> = Vec::new();
+    let mut n_alternates: usize = 0;
+    let mut n_deduped: usize = 0;
+
+    for path in &touched_paths {
+        let mf = match modified_files.get(path) {
+            Some(mf) => mf,
+            None => continue,
+        };
+
+        if mf.deleted {
+            deleted.push(path.clone());
+            continue;
+        }
+
+        let mut content = Vec::new();
+        mf.write_to(&mut content).context("writing file content")?;
+
+        let mode = match &mf.permissions {
+            Some(p) => {
+                use std::os::unix::fs::PermissionsExt;
+                p.mode()
+            }
+            None => mode_map.get(path).copied().unwrap_or(0o100644),
+        };
+        let mode = if mode & 0o111 != 0 { 0o100755 } else { 0o100644 };
+
+        let oid = compute_blob_oid(&content);
+
+        let blob_mark = if let Some(cached) = blob_cache.get(&oid) {
+            n_deduped += 1;
+            cached.clone()
+        } else {
+            let in_linux = git_source.blob_exists(oid);
+            if in_linux {
+                n_alternates += 1;
+                let bm = BlobMark::Alternates(oid);
+                blob_cache.insert(oid, bm.clone());
+                bm
+            } else {
+                let (shard_idx, mark) = shard_pool.emit_blob(content)
+                    .context("emitting blob to shard")?;
+                let bm = BlobMark::Shard(shard_idx, mark);
+                blob_cache.insert(oid, bm.clone());
+                bm
+            }
+        };
+
+        blobs.push(BlobEntry { path: path.clone(), blob_mark, mode });
+    }
+
+    // Rename sources must be deleted from the base tree
+    for src in rename_sources {
+        if !touched_paths.contains(&src) {
+            deleted.push(src);
+        }
+    }
+
+    if !quiet {
+        eprintln!(
+            "  one-shot: {} blobs, {} deleted, alternates={n_alternates}  deduped={n_deduped}",
+            blobs.len(), deleted.len()
+        );
+    }
+
+    // Synthetic meta for the single squashed commit; caller sets author_timestamp
+    let meta = PatchMeta {
+        source_path: PathBuf::new(),
+        author_name: "kexpand".to_string(),
+        author_email: "kexpand@localhost".to_string(),
+        author_timestamp: 0,
+        author_tz: "+0000".to_string(),
+        subject: format!("Apply {} SUSE kernel patches", stats.applied),
+        references: String::new(),
+        patch_mainline: String::new(),
+        body: String::new(),
+    };
+
+    Ok((PatchResult { meta, blobs, deleted }, stats))
+}
+
 /// Determine the lookup key (for HashMap) and target key (for output).
 fn resolve_paths(file_patch: &TextFilePatch) -> (PathBuf, PathBuf) {
     match (file_patch.old_filename(), file_patch.new_filename()) {
