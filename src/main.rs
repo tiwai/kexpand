@@ -24,16 +24,9 @@ use crate::git_source::GitSource;
 use crate::kernel_source::KernelSource;
 
 #[derive(Parser, Debug)]
-#[command(about = "Expand SUSE kernel-source patches into a git repository")]
+#[command(about = "Expand SUSE kernel-source patches into a git repository.\n\
+    Run from the root of a kernel-source.git working tree.")]
 struct Cli {
-    /// Path to kernel-source.git (bare clone or working tree)
-    #[arg(short = 's', long, env = "KSOURCE_GIT")]
-    source: PathBuf,
-
-    /// Branch name in kernel-source.git to read from (also used as output branch name)
-    #[arg(short = 'b', long, default_value = "master")]
-    branch: String,
-
     /// Path to upstream linus git repo (read-only)
     #[arg(short = 'l', long, env = "LINUX_GIT")]
     linus: PathBuf,
@@ -86,13 +79,15 @@ fn main() -> Result<()> {
             .context("building rayon thread pool")?;
     }
 
-    // Open kernel-source at the specified branch
-    let ks = KernelSource::open(&cli.source, &cli.branch)
-        .with_context(|| format!("opening kernel-source branch '{}'", cli.branch))?;
+    let branch = "master";
 
-    // Detect base tag from rpm/config.sh on the branch
+    // Open kernel-source working tree at the current directory
+    let ks = KernelSource::open(Path::new("."))
+        .context("opening kernel-source (run from its working-tree root)")?;
+
+    // Detect base tag from rpm/config.sh
     let base_tag = ks.base_tag()?;
-    println!("Branch: {}  Base tag: {}", cli.branch, base_tag);
+    println!("Base tag: {}", base_tag);
 
     // Parse series.conf from the branch
     let series = ks.series()?;
@@ -197,7 +192,7 @@ fn main() -> Result<()> {
         &patch_results,
         &mark_maps,
         git_source.base_commit_sha1(),
-        &cli.branch,
+        branch,
         committer_timestamp,
     )?;
     fi.done().context("sending done to commit fast-import")?;

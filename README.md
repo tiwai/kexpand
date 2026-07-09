@@ -12,6 +12,8 @@ slow for a large series.
 
 `kexpand` does the same job much faster by:
 
+- Reading and parsing all patches **directly from the working tree** (plain file reads,
+  no git object inflation)
 - Parsing all patches **in parallel** (via [rayon](https://github.com/rayon-rs/rayon)
   and [rapidquilt](https://github.com/openSUSE/rapidquilt)'s `libpatch`)
 - Applying patches to an **in-memory file state** (no working-tree checkout needed)
@@ -24,16 +26,17 @@ slow for a large series.
 
 | Phase | Time |
 |---|---|
+| Read patches | ~1.5 s |
 | Parallel parse | ~0.3 s |
-| Apply + git fast-import | ~124 s |
-| **Total** | **~2 min** |
+| Apply + git fast-import | ~30 s |
+| **Total** | **~45 s** |
 
 ## Prerequisites
 
 - Rust toolchain (edition 2021)
 - A clone of [linus/linux](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git)
   (read-only access is sufficient)
-- A clone of SUSE's kernel-source.git (read-only access is sufficient)
+- A checkout of SUSE's kernel-source.git at the branch you want to expand
 
 ## Build
 
@@ -45,16 +48,14 @@ The binary is placed at `target/release/kexpand`.
 
 ## Usage
 
+`kexpand` must be run from the root of a kernel-source.git working tree (i.e. the
+branch you want to expand must be checked out there).
+
 ```
-kexpand [OPTIONS] --output <OUTPUT>
+kexpand [OPTIONS] --linus <LINUS> --output <OUTPUT>
 
 Options:
-  -s, --source <SOURCE>    kernel-source.git (bare clone or working tree)
-                           [$KSOURCE_GIT]
-  -b, --branch <BRANCH>   Branch in kernel-source.git to read from;
-                           also used as the output branch name [default: master]
-  -l, --linus <LINUS>     Upstream linus git repo (read-only)
-                           [$LINUX_GIT]
+  -l, --linus <LINUS>     Upstream linus git repo (read-only) [$LINUX_GIT]
   -o, --output <OUTPUT>   Output git repo to create
   -j, --jobs <JOBS>       Threads for parallel parsing (0 = auto) [default: 0]
       --max-fuzz <FUZZ>   Hunk fuzz level [default: 2]
@@ -64,23 +65,22 @@ Options:
   -h, --help              Print help
 ```
 
-`-s` and `-l` are required unless the corresponding environment variable is set.
+`-l` is required unless `$LINUX_GIT` is set.
 
 ### Example
 
 ```sh
-export LINUX_GIT=~/git/linus
-export KSOURCE_GIT=~/kernel/suse/kernel-source
+cd ~/kernel/suse/kernel-source
+git checkout SLE15-SP7
 
 kexpand \
-  --branch SLE15-SP7 \
+  --linus ~/git/linus \
   --output ~/git/suse-expanded
 ```
 
-This reads `series.conf`, all patch files, and `rpm/config.sh` directly from the
-`SLE15-SP7` branch of `kernel-source.git` (no working-tree checkout needed), then
-creates `~/git/suse-expanded` with a branch `SLE15-SP7` containing one commit per
-non-guarded patch.
+This reads `series.conf`, all patch files, and `rpm/config.sh` from the current
+working tree, then creates `~/git/suse-expanded` with a branch `master` containing
+one commit per non-guarded patch.
 
 The output repo uses git alternates so it shares all upstream objects with the
 linus clone; only the new blobs and commit/tree objects are stored locally.
