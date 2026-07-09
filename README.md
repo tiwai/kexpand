@@ -55,6 +55,7 @@ branch you want to expand must be checked out there).
 kexpand [OPTIONS] --linus <LINUS> --output <OUTPUT>
 
 Options:
+  -b, --branch <BRANCH>   Output branch name in the destination repo [default: master]
   -l, --linus <LINUS>     Upstream linus git repo (read-only) [$LINUX_GIT]
   -o, --output <OUTPUT>   Output git repo to create
   -j, --jobs <JOBS>       Threads for parallel parsing (0 = auto) [default: 0]
@@ -75,12 +76,13 @@ git checkout SLE15-SP7
 
 kexpand \
   --linus ~/git/linus \
-  --output ~/git/suse-expanded
+  --output ~/git/suse-expanded \
+  --branch SLE15-SP7
 ```
 
 This reads `series.conf`, all patch files, and `rpm/config.sh` from the current
-working tree, then creates `~/git/suse-expanded` with a branch `master` containing
-one commit per non-guarded patch.
+working tree, then creates `~/git/suse-expanded` with a branch `SLE15-SP7`
+containing one commit per non-guarded patch.
 
 The output repo uses git alternates so it shares all upstream objects with the
 linus clone; only the new blobs and commit/tree objects are stored locally.

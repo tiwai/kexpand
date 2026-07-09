@@ -27,6 +27,10 @@ use crate::kernel_source::KernelSource;
 #[command(about = "Expand SUSE kernel-source patches into a git repository.\n\
     Run from the root of a kernel-source.git working tree.")]
 struct Cli {
+    /// Output branch name in the destination repo [default: master]
+    #[arg(short = 'b', long, default_value = "master")]
+    branch: String,
+
     /// Path to upstream linus git repo (read-only)
     #[arg(short = 'l', long, env = "LINUX_GIT")]
     linus: PathBuf,
@@ -79,8 +83,6 @@ fn main() -> Result<()> {
             .context("building rayon thread pool")?;
     }
 
-    let branch = "master";
-
     // Open kernel-source working tree at the current directory
     let ks = KernelSource::open(Path::new("."))
         .context("opening kernel-source (run from its working-tree root)")?;
@@ -89,7 +91,7 @@ fn main() -> Result<()> {
     let base_tag = ks.base_tag()?;
     println!("Base tag: {}", base_tag);
 
-    // Parse series.conf from the branch
+    // Parse series.conf
     let series = ks.series()?;
     println!("Patches to apply: {}", series.len());
 
@@ -100,7 +102,6 @@ fn main() -> Result<()> {
 
     let arena = ByteArena::new();
 
-    // Read all patch blobs from the branch via git cat-file --batch
     let t0 = Instant::now();
     println!("Reading patches...");
     let patch_entries = ks.read_patches(&series)?;
@@ -192,7 +193,7 @@ fn main() -> Result<()> {
         &patch_results,
         &mark_maps,
         git_source.base_commit_sha1(),
-        branch,
+        &cli.branch,
         committer_timestamp,
     )?;
     fi.done().context("sending done to commit fast-import")?;
