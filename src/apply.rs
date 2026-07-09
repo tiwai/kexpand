@@ -15,7 +15,7 @@ use crate::patch_header::{parse_header, PatchMeta};
 /// Blob reference during the shard phase (before mark→SHA-1 resolution).
 #[derive(Clone)]
 pub enum BlobMark {
-    /// Already exists in the linus alternates ODB; SHA-1 is known immediately.
+    /// Already exists in the linux alternates ODB; SHA-1 is known immediately.
     Alternates(git2::Oid),
     /// Emitted to `shard[shard_idx]` with the given local mark.
     Shard(usize, u64),
@@ -134,7 +134,7 @@ pub fn apply_blobs<'a>(
     let mut t_odb = std::time::Duration::ZERO;
     let mut t_shard = std::time::Duration::ZERO;
     // Cache: blob SHA-1 → BlobMark. Avoids re-emitting blobs already in shards
-    // or in the linus alternates.
+    // or in the linux alternates.
     let mut blob_cache: HashMap<git2::Oid, BlobMark> = HashMap::new();
     let mut n_alternates: usize = 0;
     let mut n_deduped: usize = 0;
@@ -238,9 +238,9 @@ pub fn apply_blobs<'a>(
                     cached.clone()
                 } else {
                     let to = std::time::Instant::now();
-                    let in_linus = git_source.blob_exists(oid);
+                    let in_linux = git_source.blob_exists(oid);
                     t_odb += to.elapsed();
-                    if in_linus {
+                    if in_linux {
                         n_alternates += 1;
                         let bm = BlobMark::Alternates(oid);
                         blob_cache.insert(oid, bm.clone());

@@ -14,9 +14,9 @@ pub struct GitSource {
 }
 
 impl GitSource {
-    pub fn new(linus: &Path, base_tag: &str) -> Result<Self> {
-        let repo = Repository::open(linus)
-            .with_context(|| format!("opening git repo: {}", linus.display()))?;
+    pub fn new(linux: &Path, base_tag: &str) -> Result<Self> {
+        let repo = Repository::open(linux)
+            .with_context(|| format!("opening git repo: {}", linux.display()))?;
 
         let (commit_sha1, tree_oid) = {
             let obj = repo.revparse_single(base_tag)
@@ -54,7 +54,7 @@ impl GitSource {
                 let mut guard = cell.borrow_mut();
                 if guard.is_none() {
                     *guard = Some(Repository::open(&repo_path)
-                        .context("opening linus repo")?);
+                        .context("opening linux repo")?);
                 }
                 let repo = guard.as_ref().unwrap();
                 let tree = repo.find_tree(tree_oid).context("finding base tree")?;

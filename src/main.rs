@@ -31,9 +31,9 @@ struct Cli {
     #[arg(short = 'b', long, default_value = "master")]
     branch: String,
 
-    /// Path to upstream linus git repo (read-only) [$LINUX_GIT]
+    /// Path to upstream linux git repo (read-only) [$LINUX_GIT]
     #[arg(short = 'l', long, env = "LINUX_GIT")]
-    linus: Option<PathBuf>,
+    linux: Option<PathBuf>,
 
     /// Output git repository to create
     output: PathBuf,
@@ -73,8 +73,8 @@ struct Cli {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let linus = cli.linus
-        .context("--linus / $LINUX_GIT is required")?;
+    let linux = cli.linux
+        .context("--linux / $LINUX_GIT is required")?;
 
     // Set up thread pool
     if cli.jobs > 0 {
@@ -98,7 +98,7 @@ fn main() -> Result<()> {
 
     // Set up output repo
     if !cli.dry_run {
-        init_output_repo(&cli.output, &linus)?;
+        init_output_repo(&cli.output, &linux)?;
     }
 
     let arena = ByteArena::new();
@@ -114,8 +114,8 @@ fn main() -> Result<()> {
     let parsed = parse_patches(patch_entries, &arena)?;
     println!("Parsed {} patches in {:.1}s", parsed.len(), t1.elapsed().as_secs_f64());
 
-    // Open the linus git source
-    let git_source = GitSource::new(&linus, &base_tag)?;
+    // Open the linux git source
+    let git_source = GitSource::new(&linux, &base_tag)?;
     println!("Base commit: {}", git_source.base_commit_sha1());
 
     // Pre-warm: load all base-tree files touched by patches in parallel
@@ -260,11 +260,11 @@ fn emit_commits<W: std::io::Write>(
 }
 
 /// Repack the fast-import pack using parallel delta-compression, WITHOUT
-/// scanning the alternates (linus) graph. Strategy:
+/// scanning the alternates (linux) graph. Strategy:
 ///
 /// 1. List all objects in the existing pack via `git show-index`.
 /// 2. Pipe those SHAs into `git pack-objects --delta-base-offset` which finds
-///    deltas among local objects only (no alternates walk = no ~80s linus scan).
+///    deltas among local objects only (no alternates walk = no ~80s linux scan).
 /// 3. Atomically swap the new pack in and delete the old one.
 fn run_repack(output: &std::path::Path, threads: usize) -> Result<()> {
     use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -360,8 +360,8 @@ fn run_repack(output: &std::path::Path, threads: usize) -> Result<()> {
     Ok(())
 }
 
-/// Initialize the output git repo with alternates pointing to linus objects.
-fn init_output_repo(output: &std::path::Path, linus: &std::path::Path) -> Result<()> {
+/// Initialize the output git repo with alternates pointing to linux objects.
+fn init_output_repo(output: &std::path::Path, linux: &std::path::Path) -> Result<()> {
     if output.exists() {
         println!("Output repo exists, using it");
         return Ok(());
@@ -375,15 +375,15 @@ fn init_output_repo(output: &std::path::Path, linus: &std::path::Path) -> Result
         bail!("git init failed");
     }
 
-    // Write alternates to share objects with linus repo
+    // Write alternates to share objects with linux repo
     let info_dir = output.join(".git/objects/info");
     std::fs::create_dir_all(&info_dir).context("creating objects/info")?;
-    let linus_objects = linus.canonicalize()
-        .with_context(|| format!("canonicalizing {}", linus.display()))?
+    let linux_objects = linux.canonicalize()
+        .with_context(|| format!("canonicalizing {}", linux.display()))?
         .join(".git/objects");
     std::fs::write(
         info_dir.join("alternates"),
-        format!("{}\n", linus_objects.display()),
+        format!("{}\n", linux_objects.display()),
     ).context("writing alternates")?;
 
     println!("Initialized output repo at {}", output.display());
