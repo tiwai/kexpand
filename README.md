@@ -1,7 +1,8 @@
 # kexpand
 
 Fast tool to expand SUSE kernel-source.git patches into a standard Linux kernel git
-repository, creating one git commit per patch.
+repository, creating one git commit per patch (or a single squashed commit with
+`--one-shot`).
 
 ## Background
 
@@ -55,17 +56,22 @@ branch you want to expand must be checked out there).
 kexpand [OPTIONS] <OUTPUT>
 
 Arguments:
-  <OUTPUT>                Output git repo to create
+  <OUTPUT>                         Output git repo to create
 
 Options:
-  -b, --branch <BRANCH>   Output branch name in the destination repo [default: master]
-  -l, --linux <LINUX>     Upstream linux git repo (read-only) [$LINUX_GIT]
-  -j, --jobs <JOBS>       Threads for parallel parsing (0 = auto) [default: 0]
-      --max-fuzz <FUZZ>   Hunk fuzz level [default: 2]
-      --skip-failed       Warn and skip patches that fail to apply
-  -v, --verbose           Print each patch as it is applied
-      --dry-run           Parse and apply in memory without writing git output
-  -h, --help              Print help
+  -b, --branch <BRANCH>            Output branch name in the destination repo [default: master]
+  -l, --linux <LINUX>              Upstream linux git repo (read-only) [$LINUX_GIT]
+  -j, --jobs <JOBS>                Threads for parallel parsing (0 = auto) [default: 0]
+      --max-fuzz <FUZZ>            Hunk fuzz level [default: 2]
+      --skip-failed                Warn and skip patches that fail to apply
+  -v, --verbose                    Print each patch as it is applied
+      --dry-run                    Parse and apply in memory without writing git output
+  -q, --quiet                      Suppress progress output
+  -R, --no-repack                  Skip the final git repack step
+      --repack-threads <THREADS>   Threads for git repack (0 = auto) [default: 0]
+      --blob-shards <N>            Parallel blob fast-import processes (0 = auto) [default: 0]
+  -1, --one-shot                   Squash all patches into a single commit
+  -h, --help                       Print help
 ```
 
 `-l` is required unless `$LINUX_GIT` is set.
