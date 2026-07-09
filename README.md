@@ -30,7 +30,52 @@ slow for a large series.
 | Read patches | ~1.5 s |
 | Parallel parse | ~0.3 s |
 | Apply + git fast-import | ~30 s |
+| Repack | ~13 s |
 | **Total** | **~45 s** |
+
+### Performance tuning
+
+Two options offer large speedups at the cost of output fidelity.
+
+**`-R` / `--no-repack`** — skip delta-compression
+
+The final `git repack` step delta-compresses the new objects so the repo is
+smaller and cheaper to clone or push.  For large series it is also the single
+longest phase.  Skipping it leaves the pack uncompressed, which costs extra
+disk space and makes some git operations slower, but is fine when you only
+need a quick look at the expanded tree or plan to run `git gc` later at your
+own convenience.
+
+| Configuration | Time (SLE15-SP7) |
+|---|---|
+| Default | ~45 s |
+| `-R` (no repack) | ~32 s |
+
+**`-1` / `--one-shot`** — single squashed commit
+
+In normal mode kexpand writes one commit per patch, which means it also emits a
+git blob for every intermediate state of every file — including all the versions
+a heavily-patched file goes through before reaching its final content.  With
+`--one-shot` all patches are applied to an in-memory tree first, and then only
+the **final state** of each modified file is emitted as a blob; the result is a
+single commit on top of the base tag.
+
+Because many source files are touched by multiple patches across a large series,
+skipping intermediate blob states cuts the fast-import I/O dramatically and
+makes the apply phase much faster.
+
+The trade-off is the loss of per-patch git history: `git log -p`, `git blame`,
+and `git bisect` at the patch level are no longer possible.  Use it when you
+only need a snapshot of the fully-patched tree rather than the full history.
+
+Combining both flags gives the fastest possible result:
+
+| Configuration | Time (SLE15-SP7) |
+|---|---|
+| Default | ~45 s |
+| `-R` | ~32 s |
+| `-1` | TBD |
+| `-1 -R` | TBD |
 
 ## Prerequisites
 
