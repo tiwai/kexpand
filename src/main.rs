@@ -27,16 +27,15 @@ use crate::kernel_source::KernelSource;
 #[command(about = "Expand SUSE kernel-source patches into a git repository.\n\
     Run from the root of a kernel-source.git working tree.")]
 struct Cli {
-    /// Output branch name in the destination repo [default: master]
+    /// Output branch name in the destination repo
     #[arg(short = 'b', long, default_value = "master")]
     branch: String,
 
-    /// Path to upstream linus git repo (read-only)
+    /// Path to upstream linus git repo (read-only) [$LINUX_GIT]
     #[arg(short = 'l', long, env = "LINUX_GIT")]
-    linus: PathBuf,
+    linus: Option<PathBuf>,
 
     /// Output git repository to create
-    #[arg(short = 'o', long)]
     output: PathBuf,
 
     /// Number of threads for parallel processing (0 = auto)
@@ -74,6 +73,8 @@ struct Cli {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let linus = cli.linus
+        .context("--linus / $LINUX_GIT is required")?;
 
     // Set up thread pool
     if cli.jobs > 0 {
@@ -97,7 +98,7 @@ fn main() -> Result<()> {
 
     // Set up output repo
     if !cli.dry_run {
-        init_output_repo(&cli.output, &cli.linus)?;
+        init_output_repo(&cli.output, &linus)?;
     }
 
     let arena = ByteArena::new();
@@ -114,7 +115,7 @@ fn main() -> Result<()> {
     println!("Parsed {} patches in {:.1}s", parsed.len(), t1.elapsed().as_secs_f64());
 
     // Open the linus git source
-    let git_source = GitSource::new(&cli.linus, &base_tag)?;
+    let git_source = GitSource::new(&linus, &base_tag)?;
     println!("Base commit: {}", git_source.base_commit_sha1());
 
     // Pre-warm: load all base-tree files touched by patches in parallel
