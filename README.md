@@ -25,13 +25,17 @@ slow for a large series.
 
 ### Performance (SLE15-SP7, 60 857 patches)
 
+Default mode (one commit per patch):
+
 | Phase | Time |
 |---|---|
-| Read patches | ~1.5 s |
-| Parallel parse | ~0.3 s |
-| Apply + git fast-import | ~30 s |
-| Repack | ~13 s |
-| **Total** | **~45 s** |
+| Read + parse patches | ~0.2 s |
+| Pre-load source files | ~1.2 s |
+| Apply patches + emit blobs | ~8.5 s |
+| Drain blob shards | ~2.2 s |
+| Emit commits (fast-import) | ~8.5 s |
+| Repack | ~10.4 s |
+| **Total** | **~31 s** |
 
 ### Performance tuning
 
@@ -46,11 +50,6 @@ disk space and makes some git operations slower, but is fine when you only
 need a quick look at the expanded tree or plan to run `git gc` later at your
 own convenience.
 
-| Configuration | Time (SLE15-SP7) |
-|---|---|
-| Default | ~45 s |
-| `-R` (no repack) | ~32 s |
-
 **`-1` / `--one-shot`** — single squashed commit
 
 In normal mode kexpand writes one commit per patch, which means it also emits a
@@ -61,8 +60,9 @@ the **final state** of each modified file is emitted as a blob; the result is a
 single commit on top of the base tag.
 
 Because many source files are touched by multiple patches across a large series,
-skipping intermediate blob states cuts the fast-import I/O dramatically and
-makes the apply phase much faster.
+skipping intermediate blob states cuts the number of blobs dramatically (23 636
+vs several hundred thousand for SLE15-SP7), which slashes fast-import I/O and
+makes the apply phase an order of magnitude faster.
 
 The trade-off is the loss of per-patch git history: `git log -p`, `git blame`,
 and `git bisect` at the patch level are no longer possible.  Use it when you
@@ -72,10 +72,10 @@ Combining both flags gives the fastest possible result:
 
 | Configuration | Time (SLE15-SP7) |
 |---|---|
-| Default | ~45 s |
-| `-R` | ~32 s |
-| `-1` | TBD |
-| `-1 -R` | TBD |
+| Default | ~31 s |
+| `-R` (no repack) | ~21 s |
+| `-1` (one-shot) | ~5 s |
+| `-1 -R` | ~3 s |
 
 ## Prerequisites
 
