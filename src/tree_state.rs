@@ -153,21 +153,23 @@ impl TreeState {
     }
 
     /// Mark `start` and all its ancestor directories as dirty (oid = None).
-    /// Stops early if an ancestor is already dirty (implies all higher dirs are too).
+    /// Stops early if an ancestor is already in `dirty` (implies all higher dirs are too).
     fn mark_dirty(&mut self, start: &Path) {
         let mut current = start.to_path_buf();
         loop {
+            // Check membership *before* moving current into the set.
+            // We cannot use oid.is_none() as the stop condition because new
+            // directories (absent from the base tree) start with oid=None but
+            // have never been inserted into `dirty`, so their ancestors haven't
+            // been marked yet.
+            let already_dirty = self.dirty.contains(&current);
             if let Some(state) = self.dirs.get_mut(&current) {
-                if state.oid.is_none() {
-                    return; // already dirty → ancestors are dirty too
-                }
                 state.oid = None;
             }
-            // Compute parent before moving `current` into the HashSet.
             let at_root = current == PathBuf::new();
             let next = if at_root { PathBuf::new() } else { parent_path(&current) };
             self.dirty.insert(current); // move (no clone)
-            if at_root { return; }
+            if at_root || already_dirty { return; }
             current = next;
         }
     }
