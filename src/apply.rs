@@ -12,22 +12,16 @@ use crate::blob_shards::BlobShardPool;
 use crate::git_source::GitSource;
 use crate::patch_header::{parse_header, PatchMeta};
 
-/// Blob reference during the shard phase (before mark→SHA-1 resolution).
 #[derive(Clone)]
-pub enum BlobMark {
-    /// Already exists in the linux alternates ODB; SHA-1 is known immediately.
-    Alternates(git2::Oid),
-    /// Emitted to `shard[shard_idx]` with the given local mark.
-    Shard(usize, u64),
-}
-
 pub struct BlobEntry {
     pub path: PathBuf,
-    pub blob_mark: BlobMark,
+    /// SHA-1 of the blob content (computed at apply time via OpenSSL SHA-NI).
+    /// Valid in both the alternates-ODB and shard-fast-import cases.
+    pub oid: git2::Oid,
     pub mode: u32,
 }
 
-/// One successfully-applied patch, with blob references not yet resolved to SHA-1s.
+#[derive(Clone)]
 pub struct PatchResult {
     pub meta: PatchMeta,
     pub blobs: Vec<BlobEntry>,
@@ -45,27 +39,41 @@ pub struct Stats {
     pub skipped_error: usize,
 }
 
-/// Compute git blob SHA-1 using OpenSSL's native SHA-1 (SHA-NI accelerated),
-/// bypassing libgit2's sha1dc (collision-detecting, ~4× slower).
-/// Git format: SHA1("blob {len}\0{content}")
-fn compute_blob_oid(content: &[u8]) -> git2::Oid {
+/// Fill `buf` with the file content and return the git blob SHA-1.
+///
+/// `buf` is a caller-supplied reusable Vec cleared and refilled each call.
+/// This avoids per-blob allocation for the ~55 % of blobs that are already
+/// in the linux alternates ODB — only shard-bound blobs need a clone.
+///
+/// SHA-1 is computed via a single OpenSSL SHA-NI update on the contiguous
+/// buffer (2-3× faster than per-line updates for typical kernel line sizes).
+fn collect_and_hash(mf: &ModifiedFile, buf: &mut Vec<u8>) -> git2::Oid {
     use openssl::sha::Sha1;
+
+    // Refill the reusable buffer with direct extend (one copy per byte).
+    buf.clear();
+    for line in &mf.content {
+        buf.extend_from_slice(line);
+    }
+
+    // Hash blob header + full buffer in two calls.
     let mut hasher = Sha1::new();
     let mut hdr = [0u8; 26];
     hdr[..5].copy_from_slice(b"blob ");
-    let mut n = content.len();
+    let mut n = buf.len();
     let mut digits = [0u8; 20];
-    let mut ndigits = 0;
+    let mut nd = 0;
     loop {
-        digits[ndigits] = b'0' + (n % 10) as u8;
-        ndigits += 1;
+        digits[nd] = b'0' + (n % 10) as u8;
+        nd += 1;
         n /= 10;
         if n == 0 { break; }
     }
-    for i in 0..ndigits { hdr[5 + i] = digits[ndigits - 1 - i]; }
-    hdr[5 + ndigits] = 0;
-    hasher.update(&hdr[..6 + ndigits]);
-    hasher.update(content);
+    for i in 0..nd { hdr[5 + i] = digits[nd - 1 - i]; }
+    hdr[5 + nd] = 0;
+    hasher.update(&hdr[..6 + nd]);
+    hasher.update(buf);
+
     git2::Oid::from_bytes(&hasher.finish()).expect("OpenSSL SHA-1 is 20 bytes")
 }
 
@@ -130,13 +138,15 @@ pub fn apply_blobs<'a>(
     let mut results: Vec<PatchResult> = Vec::new();
     let analyses = AnalysisSet::default();
 
-    let mut t_write_to = std::time::Duration::ZERO;
-    let mut t_sha1 = std::time::Duration::ZERO;
+    let mut t_hash_collect = std::time::Duration::ZERO;
     let mut t_odb = std::time::Duration::ZERO;
     let mut t_shard = std::time::Duration::ZERO;
-    // Cache: blob SHA-1 → BlobMark. Avoids re-emitting blobs already in shards
-    // or in the linux alternates.
-    let mut blob_cache: HashMap<git2::Oid, BlobMark> = HashMap::new();
+    // Tracks every blob SHA-1 we have already emitted or confirmed present.
+    // Avoids re-emitting identical blob content seen earlier in the run.
+    let mut blob_seen: HashSet<git2::Oid> = HashSet::new();
+    // Reusable content buffer: avoids per-blob allocation for alternates/deduped blobs.
+    // Only cloned for the ~45 % of blobs that must be sent to a shard fast-import.
+    let mut content_buf: Vec<u8> = Vec::with_capacity(256 * 1024);
     let mut n_alternates: usize = 0;
     let mut n_deduped: usize = 0;
 
@@ -216,11 +226,6 @@ pub fn apply_blobs<'a>(
                     deleted_paths.push(target);
                 }
             } else {
-                let tw = std::time::Instant::now();
-                let mut content = Vec::new();
-                mf.write_to(&mut content).context("writing file content")?;
-                t_write_to += tw.elapsed();
-
                 let mode = match &mf.permissions {
                     Some(p) => {
                         use std::os::unix::fs::PermissionsExt;
@@ -230,34 +235,31 @@ pub fn apply_blobs<'a>(
                 };
                 let mode = if mode & 0o111 != 0 { 0o100755 } else { 0o100644 };
 
-                let ts = std::time::Instant::now();
-                let oid = compute_blob_oid(&content);
-                t_sha1 += ts.elapsed();
+                // Collect into reusable buffer and hash (single SHA-NI update).
+                let th = std::time::Instant::now();
+                let oid = collect_and_hash(mf, &mut content_buf);
+                t_hash_collect += th.elapsed();
 
-                let blob_mark = if let Some(cached) = blob_cache.get(&oid) {
+                if blob_seen.contains(&oid) {
                     n_deduped += 1;
-                    cached.clone()
                 } else {
+                    blob_seen.insert(oid);
                     let to = std::time::Instant::now();
                     let in_linux = git_source.blob_exists(oid);
                     t_odb += to.elapsed();
                     if in_linux {
                         n_alternates += 1;
-                        let bm = BlobMark::Alternates(oid);
-                        blob_cache.insert(oid, bm.clone());
-                        bm
+                        // No allocation: blob is in linus alternates ODB.
                     } else {
+                        // Clone only for the shard path (~45 % of blobs).
                         let tc = std::time::Instant::now();
-                        let (shard_idx, mark) = shard_pool.emit_blob(content)
+                        shard_pool.emit_blob(content_buf.clone())
                             .context("emitting blob to shard")?;
                         t_shard += tc.elapsed();
-                        let bm = BlobMark::Shard(shard_idx, mark);
-                        blob_cache.insert(oid, bm.clone());
-                        bm
                     }
-                };
+                }
 
-                blobs.push(BlobEntry { path: target, blob_mark, mode });
+                blobs.push(BlobEntry { path: target, oid, mode });
             }
         }
 
@@ -267,9 +269,8 @@ pub fn apply_blobs<'a>(
 
     if !quiet {
         eprintln!(
-            "  apply timing: write_to={:.1}s  sha1={:.1}s  odb={:.1}s  shard_send={:.1}s  alternates={n_alternates}  deduped={n_deduped}",
-            t_write_to.as_secs_f64(), t_sha1.as_secs_f64(),
-            t_odb.as_secs_f64(), t_shard.as_secs_f64()
+            "  apply timing: hash_collect={:.1}s  odb={:.1}s  shard_send={:.1}s  alternates={n_alternates}  deduped={n_deduped}",
+            t_hash_collect.as_secs_f64(), t_odb.as_secs_f64(), t_shard.as_secs_f64()
         );
     }
 
@@ -358,7 +359,8 @@ pub fn apply_blobs_one_shot<'a>(
     }
 
     // Emit blobs for the final state of all touched paths
-    let mut blob_cache: HashMap<git2::Oid, BlobMark> = HashMap::new();
+    let mut blob_seen: HashSet<git2::Oid> = HashSet::new();
+    let mut content_buf: Vec<u8> = Vec::with_capacity(256 * 1024);
     let mut blobs: Vec<BlobEntry> = Vec::new();
     let mut deleted: Vec<PathBuf> = Vec::new();
     let mut n_alternates: usize = 0;
@@ -375,9 +377,6 @@ pub fn apply_blobs_one_shot<'a>(
             continue;
         }
 
-        let mut content = Vec::new();
-        mf.write_to(&mut content).context("writing file content")?;
-
         let mode = match &mf.permissions {
             Some(p) => {
                 use std::os::unix::fs::PermissionsExt;
@@ -387,28 +386,22 @@ pub fn apply_blobs_one_shot<'a>(
         };
         let mode = if mode & 0o111 != 0 { 0o100755 } else { 0o100644 };
 
-        let oid = compute_blob_oid(&content);
+        let oid = collect_and_hash(mf, &mut content_buf);
 
-        let blob_mark = if let Some(cached) = blob_cache.get(&oid) {
+        if blob_seen.contains(&oid) {
             n_deduped += 1;
-            cached.clone()
         } else {
+            blob_seen.insert(oid);
             let in_linux = git_source.blob_exists(oid);
             if in_linux {
                 n_alternates += 1;
-                let bm = BlobMark::Alternates(oid);
-                blob_cache.insert(oid, bm.clone());
-                bm
             } else {
-                let (shard_idx, mark) = shard_pool.emit_blob(content)
+                shard_pool.emit_blob(content_buf.clone())
                     .context("emitting blob to shard")?;
-                let bm = BlobMark::Shard(shard_idx, mark);
-                blob_cache.insert(oid, bm.clone());
-                bm
             }
-        };
+        }
 
-        blobs.push(BlobEntry { path: path.clone(), blob_mark, mode });
+        blobs.push(BlobEntry { path: path.clone(), oid, mode });
     }
 
     // Rename sources must be deleted from the base tree

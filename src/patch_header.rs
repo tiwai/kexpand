@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use chrono::DateTime;
 use memchr::memchr_iter;
 
+#[derive(Clone)]
 pub struct PatchMeta {
     pub source_path: PathBuf,
     pub author_name: String,

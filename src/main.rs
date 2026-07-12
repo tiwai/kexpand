@@ -1,11 +1,12 @@
 mod arena;
 mod apply;
 mod blob_shards;
-mod fast_import;
+mod commit_pack;
 mod git_source;
 mod kernel_source;
 mod patch_header;
 mod series;
+mod tree_state;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -16,12 +17,13 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use libpatch::modified_file::ModifiedFile;
 
-use crate::apply::{apply_blobs, apply_blobs_one_shot, collect_patch_paths, parse_patches, BlobMark, PatchResult};
+use crate::apply::{apply_blobs, apply_blobs_one_shot, collect_patch_paths, parse_patches, PatchResult};
 use crate::arena::ByteArena;
 use crate::blob_shards::BlobShardPool;
-use crate::fast_import::{BlobRef, FastImport, Parent};
+use crate::commit_pack::CommitPackWriter;
 use crate::git_source::GitSource;
 use crate::kernel_source::KernelSource;
+use crate::tree_state::{encode_commit, TreeState};
 
 #[derive(Parser, Debug)]
 #[command(about = "Expand SUSE kernel-source patches into a git repository.\n\
@@ -195,40 +197,22 @@ fn main() -> Result<()> {
     };
     if !cli.quiet { println!("Applied {} patches in {:.1}s", stats.applied, t_apply.elapsed().as_secs_f64()); }
 
-    // Phase 2: drain all shard fast-imports in parallel, collect mark→SHA-1 maps
+    // Phase 2: drain all blob shard fast-imports (blobs must land in the ODB
+    //           before the tree objects reference their SHA-1s).
     let t_drain = Instant::now();
     if !cli.quiet { println!("Draining blob shards..."); }
-    let mark_maps = shard_pool.finish_and_read_marks()?;
+    shard_pool.finish().context("draining blob shards")?;
     if !cli.quiet { println!("Blob shards drained in {:.1}s", t_drain.elapsed().as_secs_f64()); }
 
-    // Phase 3: emit commits (no blob data, just commit metadata + SHA-1 blob refs)
+    // Phase 3: build trees and commits directly in Rust — no external process.
     let t_commits = Instant::now();
-    if !cli.quiet { println!("Emitting commits..."); }
-    let mut commit_child = Command::new("git")
-        .args(["-c", "pack.compression=0", "fast-import", "--done", "--force"])
-        .current_dir(&cli.output)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(if cli.quiet { Stdio::null() } else { Stdio::inherit() })
-        .spawn()
-        .context("spawning commit fast-import")?;
-    let commit_stdin = commit_child.stdin.take().unwrap();
-    let mut fi = FastImport::new(commit_stdin);
-    emit_commits(
-        &mut fi,
-        &patch_results,
-        &mark_maps,
-        git_source.base_commit_sha1(),
-        &cli.branch,
-        committer_timestamp,
+    if !cli.quiet { println!("Building commits..."); }
+    let base_sha1 = git_source.base_commit_sha1().to_string();
+    let repo = git2::Repository::open(&cli.output).context("opening output repo")?;
+    build_commits_with_trees(
+        &patch_results, &base_sha1, &cli.branch, committer_timestamp, &repo, &cli.output, cli.quiet,
     )?;
-    fi.done().context("sending done to commit fast-import")?;
-    drop(fi);
-    let status = commit_child.wait().context("waiting for commit fast-import")?;
-    if !status.success() {
-        bail!("commit fast-import failed with {status}");
-    }
-    if !cli.quiet { println!("Commits emitted in {:.1}s", t_commits.elapsed().as_secs_f64()); }
+    if !cli.quiet { println!("Commits built in {:.1}s", t_commits.elapsed().as_secs_f64()); }
 
     if !cli.quiet {
         println!(
@@ -247,41 +231,58 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn emit_commits<W: std::io::Write>(
-    fi: &mut FastImport<W>,
+/// Build all commits by writing tree and commit objects directly into a new pack
+/// file, bypassing any external git process.  Updates the branch ref on success.
+fn build_commits_with_trees(
     results: &[PatchResult],
-    mark_maps: &[HashMap<u64, git2::Oid>],
     base_commit_sha1: &str,
     branch: &str,
     committer_timestamp: i64,
+    repo: &git2::Repository,
+    output: &Path,
+    quiet: bool,
 ) -> Result<()> {
-    let mut parent_mark: Option<u64> = None;
+    let t0 = Instant::now();
+    let mut tree_state = TreeState::new(repo, base_commit_sha1, results)
+        .context("initializing tree state from base commit")?;
+    if !quiet {
+        eprintln!("  tree state init: {:.2}s ({} dirs)", t0.elapsed().as_secs_f64(), results.len());
+    }
+
+    let pack_dir = output.join(".git/objects/pack");
+    let mut pack = CommitPackWriter::create(&pack_dir)?;
+
+    let base_oid = git2::Oid::from_str(base_commit_sha1)?;
+    let mut parent_oid: Option<git2::Oid> = Some(base_oid);
 
     for result in results {
-        let modified: Vec<(&Path, BlobRef, u32)> = result.blobs.iter()
-            .map(|e| -> Result<(&Path, BlobRef, u32)> {
-                let br = match &e.blob_mark {
-                    BlobMark::Alternates(oid) => BlobRef::Sha1(*oid),
-                    BlobMark::Shard(idx, mark) => {
-                        let oid = mark_maps[*idx].get(mark)
-                            .with_context(|| format!("shard {idx} mark :{mark} missing from marks file"))?;
-                        BlobRef::Sha1(*oid)
-                    }
-                };
-                Ok((e.path.as_path(), br, e.mode))
-            })
-            .collect::<Result<_>>()?;
+        for blob in &result.blobs {
+            tree_state.update(&blob.path, blob.oid, blob.mode)
+                .with_context(|| format!("update blob '{}'", blob.path.display()))?;
+        }
+        for deleted in &result.deleted {
+            tree_state.delete(deleted)
+                .with_context(|| format!("delete '{}'", deleted.display()))?;
+        }
 
-        let deleted: Vec<&Path> = result.deleted.iter().map(|p| p.as_path()).collect();
+        let tree_oid = tree_state.flush(&mut pack)
+            .with_context(|| format!("flush tree for '{}'", result.meta.source_path.display()))?;
 
-        let parent = match parent_mark {
-            None => Parent::BaseSha1(base_commit_sha1.to_string()),
-            Some(m) => Parent::Mark(m),
-        };
-
-        let cm = fi.emit_commit(&result.meta, branch, parent, committer_timestamp, &modified, &deleted)?;
-        parent_mark = Some(cm);
+        let commit_bytes = encode_commit(tree_oid, parent_oid, &result.meta, committer_timestamp);
+        let commit_oid = pack.write_object(1 /* commit */, &commit_bytes)?;
+        parent_oid = Some(commit_oid);
     }
+
+    pack.finish().context("finalizing commit pack")?;
+
+    // Point the branch ref at the last commit
+    let last_oid = parent_oid.ok_or_else(|| anyhow::anyhow!("no commits written"))?;
+    repo.reference(
+        &format!("refs/heads/{branch}"),
+        last_oid,
+        true,
+        "kexpand",
+    ).context("updating branch ref")?;
 
     Ok(())
 }
