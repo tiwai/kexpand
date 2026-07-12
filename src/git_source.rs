@@ -14,6 +14,11 @@ pub struct GitSource {
 }
 
 impl GitSource {
+    /// Return the underlying `git2::Repository` for the linux source repo.
+    pub fn repo(&self) -> &Repository {
+        &self.repo
+    }
+
     pub fn new(linux: &Path, base_tag: &str) -> Result<Self> {
         let repo = Repository::open(linux)
             .with_context(|| format!("opening git repo: {}", linux.display()))?;

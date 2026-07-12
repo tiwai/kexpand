@@ -1,6 +1,6 @@
-use std::collections::HashSet;
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -34,8 +34,10 @@ fn crc32_update(state: u32, data: &[u8]) -> u32 {
     crc
 }
 
-fn crc32_of(a: &[u8], b: &[u8]) -> u32 {
-    !crc32_update(crc32_update(!0u32, a), b)
+fn crc32_of_slices(slices: &[&[u8]]) -> u32 {
+    let mut state = !0u32;
+    for s in slices { state = crc32_update(state, s); }
+    !state
 }
 
 // ─── PackObjectRecord ─────────────────────────────────────────────────────────
@@ -46,39 +48,114 @@ struct PackObjectRecord {
     crc32: u32,
 }
 
+// ─── Tree delta cache entry ───────────────────────────────────────────────────
+
+struct TreeCacheEntry {
+    content: Vec<u8>,   // uncompressed tree bytes of the previous version
+    offset: u64,        // pack byte offset of that version
+    depth: u32,         // delta chain depth (0 = full object)
+}
+
+const MAX_DELTA_DEPTH: u32 = 50;
+
 // ─── CommitPackWriter ─────────────────────────────────────────────────────────
 
 /// Writes a git pack file v2 containing tree and commit objects (no blobs, no deltas).
-/// Call `write_object()` for each tree/commit, then `finish()` to seal the file
-/// and write the companion .idx — no external process needed.
+/// The entire pack is accumulated in an in-memory buffer to avoid disk I/O during
+/// the concurrent blob-shard drain phase.  Call `finish()` to flush to disk and
+/// write the companion .idx — no external process needed.
 pub struct CommitPackWriter {
-    writer: BufWriter<File>,
+    buf: Vec<u8>,
     n_objects: u32,
-    path: PathBuf,
+    pack_dir: PathBuf,
     objects: Vec<PackObjectRecord>,
     current_offset: u64,
     seen: HashSet<git2::Oid>,
+    /// Per-path cache for tree delta compression.
+    tree_cache: HashMap<PathBuf, TreeCacheEntry>,
 }
 
 impl CommitPackWriter {
     pub fn create(pack_dir: &Path) -> Result<Self> {
-        let path = pack_dir.join("pack-wip.pack");
-        let file = File::create(&path).context("creating commit pack")?;
-        let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, file);
+        // Pre-allocate ~160 MiB: 660 K tree+commit objects × ~250 bytes average.
+        let mut buf = Vec::with_capacity(160 * 1024 * 1024);
         // Pack header: magic + version 2 + placeholder object count
-        writer.write_all(b"PACK\x00\x00\x00\x02\x00\x00\x00\x00")?;
+        buf.extend_from_slice(b"PACK\x00\x00\x00\x02\x00\x00\x00\x00");
         Ok(CommitPackWriter {
-            writer,
+            buf,
             n_objects: 0,
-            path,
-            objects: Vec::with_capacity(400_000),
+            pack_dir: pack_dir.to_path_buf(),
+            objects: Vec::with_capacity(700_000),
             current_offset: 12, // 4 (magic) + 4 (version) + 4 (count) = 12
-            seen: HashSet::with_capacity(400_000),
+            seen: HashSet::with_capacity(700_000),
+            tree_cache: HashMap::new(),
         })
     }
 
-    /// Write one raw git object.  `obj_type`: 1 = commit, 4 = tree.
-    /// Returns the git object SHA-1 (computed via OpenSSL SHA-NI).
+    /// Write a tree object, using OFS_DELTA against the previous version of the same
+    /// path when possible.  Path tracking enables delta compression without needing
+    /// git pack-objects to re-sort by filename.
+    pub fn write_tree(&mut self, content: &[u8], path: &Path) -> Result<git2::Oid> {
+        let oid = self.compute_oid(2, content);
+
+        if !self.seen.insert(oid) {
+            // Already in pack — still update cache so subsequent versions can delta off it.
+            // (The existing entry at its original offset is the base.)
+            // Only update if the cache entry is stale or absent.
+            self.tree_cache.entry(path.to_path_buf()).or_insert_with(|| {
+                // We don't know the offset for the deduped OID; fall back to full object
+                // next time (depth 0, offset = current as sentinel — won't be used since
+                // the next write_tree for this path won't enter the dedup branch).
+                TreeCacheEntry { content: content.to_vec(), offset: 0, depth: 0 }
+            });
+            return Ok(oid);
+        }
+
+        // Try OFS_DELTA against the previous version of this path.
+        let try_delta = self.tree_cache.get(path).map(|e| {
+            (e.content.clone(), e.offset, e.depth)
+        });
+
+        let wrote_delta = if let Some((base_content, base_offset, base_depth)) = try_delta {
+            if base_depth < MAX_DELTA_DEPTH && base_offset > 0 {
+                let delta = git_delta_encode(&base_content, content);
+                // Use delta if it's meaningfully smaller than stored-format full object.
+                // Stored format overhead: 2 (zlib hdr) + 5 (block hdr) per 65535 bytes + 4 (adler32)
+                let full_stored_size = content.len() + 11
+                    + (content.len() / 65535) * 5;
+                if delta.len() < full_stored_size {
+                    let back_offset = self.current_offset - base_offset;
+                    self.write_ofs_delta(&delta, back_offset, oid, content);
+                    let entry = self.tree_cache.get_mut(path).unwrap();
+                    entry.content = content.to_vec();
+                    entry.offset = self.objects.last().unwrap().offset;
+                    entry.depth = base_depth + 1;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if !wrote_delta {
+            self.write_full_tree(content, oid);
+            let offset = self.objects.last().unwrap().offset;
+            self.tree_cache.insert(path.to_path_buf(), TreeCacheEntry {
+                content: content.to_vec(),
+                offset,
+                depth: 0,
+            });
+        }
+
+        Ok(oid)
+    }
+
+    /// Write one raw git object (commit or tree) as a full (non-delta) object.
+    /// `obj_type`: 1 = commit, 2 = tree.
     pub fn write_object(&mut self, obj_type: u8, content: &[u8]) -> Result<git2::Oid> {
         let type_name = match obj_type {
             1 => "commit",
@@ -86,7 +163,6 @@ impl CommitPackWriter {
             _ => bail!("unexpected obj_type {obj_type}"),
         };
 
-        // git SHA-1: sha1("type SIZE\0content")
         let git_hdr = format!("{type_name} {}\0", content.len());
         let mut hasher = Sha1::new();
         hasher.update(git_hdr.as_bytes());
@@ -94,76 +170,240 @@ impl CommitPackWriter {
         let sha1 = hasher.finish();
         let oid = git2::Oid::from_bytes(&sha1).expect("SHA-1 is 20 bytes");
 
-        // Skip duplicates: same content → same OID → already in the pack.
         if !self.seen.insert(oid) {
             return Ok(oid);
         }
 
-        // Pack object bytes: type+size varint header, then zlib-stored content
         let header = pack_type_size(obj_type, content.len());
-        let zlib = zlib_store(content);
-
-        // CRC32 over pack bytes for this object (git pack index requires it)
-        let crc = crc32_of(&header, &zlib);
-
-        let offset = self.current_offset;
-        self.objects.push(PackObjectRecord { sha1, offset, crc32: crc });
-
-        self.writer.write_all(&header)?;
-        self.writer.write_all(&zlib)?;
-        self.current_offset += (header.len() + zlib.len()) as u64;
+        let start = self.buf.len();
+        self.buf.extend_from_slice(&header);
+        let zlib_start = self.buf.len();
+        zlib_store_into(&mut self.buf, content);
+        let crc = crc32_of_slices(&[&header, &self.buf[zlib_start..]]);
+        self.objects.push(PackObjectRecord { sha1, offset: self.current_offset, crc32: crc });
+        self.current_offset += (self.buf.len() - start) as u64;
         self.n_objects += 1;
 
         Ok(oid)
     }
 
-    /// Seal the pack: patch the object count, append the 20-byte pack SHA-1,
-    /// write the companion .idx file in Rust (no subprocess), then rename both
-    /// to canonical `pack-{sha1}.{pack,idx}` names.
+    /// Flush the in-memory pack to disk: patch the object count, append the 20-byte
+    /// pack SHA-1, write the companion .idx, then rename to canonical names.
     pub fn finish(mut self) -> Result<()> {
-        self.writer.flush()?;
-        drop(self.writer);
+        self.buf[8..12].copy_from_slice(&self.n_objects.to_be_bytes());
 
-        // Patch object count at byte offset 8
-        {
-            let mut f = OpenOptions::new().write(true).open(&self.path)?;
-            f.seek(SeekFrom::Start(8))?;
-            f.write_all(&self.n_objects.to_be_bytes())?;
-        }
-
-        // Compute SHA-1 over the entire file (header + objects, correct count)
         let pack_sha1: [u8; 20] = {
-            let mut f = File::open(&self.path)?;
             let mut hasher = Sha1::new();
-            let mut buf = [0u8; 65536];
-            loop {
-                let n = f.read(&mut buf)?;
-                if n == 0 { break; }
-                hasher.update(&buf[..n]);
-            }
+            hasher.update(&self.buf);
             hasher.finish()
         };
+        self.buf.extend_from_slice(&pack_sha1);
 
-        // Append 20-byte pack checksum
-        OpenOptions::new().append(true).open(&self.path)?
-            .write_all(&pack_sha1)?;
-
-        // Canonical names derived from pack SHA-1
         let sha1_hex: String = pack_sha1.iter().map(|b| format!("{b:02x}")).collect();
-        let pack_dir = self.path.parent().unwrap();
-        let canon_pack = pack_dir.join(format!("pack-{sha1_hex}.pack"));
-        let canon_idx  = pack_dir.join(format!("pack-{sha1_hex}.idx"));
+        let canon_pack = self.pack_dir.join(format!("pack-{sha1_hex}.pack"));
+        let canon_idx  = self.pack_dir.join(format!("pack-{sha1_hex}.idx"));
 
-        // Write pack index v2 entirely in Rust (saves ~3.8s vs git index-pack)
         write_pack_index(&self.objects, &pack_sha1, &canon_idx)
             .context("writing pack index")?;
 
-        // Rename pack to canonical name
-        std::fs::rename(&self.path, &canon_pack)
-            .context("renaming pack to canonical name")?;
+        let mut f = File::create(&canon_pack).context("creating commit pack")?;
+        f.write_all(&self.buf).context("writing commit pack")?;
 
         Ok(())
     }
+
+    // ─── Internal helpers ────────────────────────────────────────────────────
+
+    fn compute_oid(&self, obj_type: u8, content: &[u8]) -> git2::Oid {
+        let type_name = if obj_type == 1 { "commit" } else { "tree" };
+        let git_hdr = format!("{type_name} {}\0", content.len());
+        let mut hasher = Sha1::new();
+        hasher.update(git_hdr.as_bytes());
+        hasher.update(content);
+        git2::Oid::from_bytes(&hasher.finish()).expect("SHA-1 is 20 bytes")
+    }
+
+    fn write_full_tree(&mut self, content: &[u8], oid: git2::Oid) {
+        let sha1: [u8; 20] = oid.as_bytes().try_into().expect("20 bytes");
+        let header = pack_type_size(2, content.len());
+        let start = self.buf.len();
+        self.buf.extend_from_slice(&header);
+        let zlib_start = self.buf.len();
+        zlib_store_into(&mut self.buf, content);
+        let crc = crc32_of_slices(&[&header, &self.buf[zlib_start..]]);
+        self.objects.push(PackObjectRecord { sha1, offset: self.current_offset, crc32: crc });
+        self.current_offset += (self.buf.len() - start) as u64;
+        self.n_objects += 1;
+    }
+
+    fn write_ofs_delta(&mut self, delta: &[u8], back_offset: u64, oid: git2::Oid, _content: &[u8]) {
+        let sha1: [u8; 20] = oid.as_bytes().try_into().expect("20 bytes");
+
+        // OFS_DELTA header: type=6, size=delta.len()
+        let type_size_hdr = pack_type_size(6, delta.len());
+
+        // Encode the back-offset (distance from current object to its base in pack)
+        let ofs_bytes = encode_ofs_back(back_offset);
+
+        // The delta bytes are zlib-stored (no actual compression — deltas are already small)
+        let obj_start = self.buf.len();
+        self.buf.extend_from_slice(&type_size_hdr);
+        self.buf.extend_from_slice(&ofs_bytes);
+        let zlib_start = self.buf.len();
+        zlib_store_into(&mut self.buf, delta);
+
+        let crc = crc32_of_slices(&[&type_size_hdr, &ofs_bytes, &self.buf[zlib_start..]]);
+        self.objects.push(PackObjectRecord { sha1, offset: self.current_offset, crc32: crc });
+        self.current_offset += (self.buf.len() - obj_start) as u64;
+        self.n_objects += 1;
+    }
+}
+
+// ─── OFS_DELTA back-offset encoding ──────────────────────────────────────────
+
+/// Encode the OFS_DELTA back-offset in git's big-endian MSB-first variable-length format.
+/// Decode: val = 0; for each byte in order: val = (val << 7) | (b & 0x7f); if !last: val += 1
+fn encode_ofs_back(mut ofs: u64) -> Vec<u8> {
+    let mut tmp = [0u8; 10];
+    let mut len = 0usize;
+    tmp[len] = (ofs & 0x7F) as u8;
+    len += 1;
+    ofs >>= 7;
+    while ofs > 0 {
+        ofs -= 1;
+        tmp[len] = 0x80 | (ofs & 0x7F) as u8;
+        len += 1;
+        ofs >>= 7;
+    }
+    // Written MSB-first
+    let mut out = vec![0u8; len];
+    for i in 0..len {
+        out[i] = tmp[len - 1 - i];
+    }
+    out
+}
+
+// ─── Git delta encoding ───────────────────────────────────────────────────────
+
+/// Produce a git-format binary delta that transforms `src` into `dst`.
+/// Output: src_size (varint) || dst_size (varint) || instructions
+///
+/// Instructions:
+///   COPY:   0x80 | flags  [offset bytes...] [size bytes...]
+///   INSERT: 0x01..0x7F   followed by that many literal bytes
+///
+/// Uses a fixed-size direct-indexed table (Vec<u32>) for O(1) lookups — no
+/// HashMap allocation.  Last-write-wins for hash collisions; extend match forward.
+fn git_delta_encode(src: &[u8], dst: &[u8]) -> Vec<u8> {
+    const BLOCK: usize = 16;
+
+    // Power-of-two table sized to ~src.len()/4; minimum 256 slots.
+    let tsize = (src.len() / 4 + 1).next_power_of_two().max(256);
+    let tmask = (tsize - 1) as u32;
+    let mut table = vec![0u32; tsize]; // 0 = empty; otherwise (pos+1)
+
+    // Build: stride=1, hash each BLOCK-byte window.  Last-write-wins on collision.
+    if src.len() >= BLOCK {
+        for i in 0..=src.len() - BLOCK {
+            let h = hash16(&src[i..i + BLOCK]) & tmask;
+            table[h as usize] = (i as u32) + 1;
+        }
+    }
+
+    let mut out = Vec::with_capacity(dst.len() / 4 + 32);
+    write_delta_varint(&mut out, src.len());
+    write_delta_varint(&mut out, dst.len());
+
+    let mut dp = 0usize;
+    let mut insert_buf: Vec<u8> = Vec::with_capacity(128);
+
+    while dp < dst.len() {
+        let remaining = dst.len() - dp;
+        let mut matched = None;
+
+        if remaining >= BLOCK {
+            let h = hash16(&dst[dp..dp + BLOCK]) & tmask;
+            let slot = table[h as usize];
+            if slot > 0 {
+                let sp = (slot - 1) as usize;
+                if sp + BLOCK <= src.len() && src[sp..sp + BLOCK] == dst[dp..dp + BLOCK] {
+                    let max_fwd = (src.len() - sp).min(dst.len() - dp).min(0xFFFF);
+                    let mut len = BLOCK;
+                    while len < max_fwd && src[sp + len] == dst[dp + len] {
+                        len += 1;
+                    }
+                    matched = Some((sp, len));
+                }
+            }
+        }
+
+        match matched {
+            Some((sp, len)) => {
+                flush_insert_buf(&mut out, &mut insert_buf);
+                emit_copy(&mut out, sp as u64, len as u64);
+                dp += len;
+            }
+            None => {
+                insert_buf.push(dst[dp]);
+                if insert_buf.len() == 127 {
+                    flush_insert_buf(&mut out, &mut insert_buf);
+                }
+                dp += 1;
+            }
+        }
+    }
+    flush_insert_buf(&mut out, &mut insert_buf);
+    out
+}
+
+fn hash16(data: &[u8]) -> u32 {
+    let mut h: u32 = 0x12345678;
+    for &b in data {
+        h = h.wrapping_mul(31).wrapping_add(b as u32);
+    }
+    h
+}
+
+fn write_delta_varint(out: &mut Vec<u8>, mut v: usize) {
+    loop {
+        if v < 0x80 { out.push(v as u8); break; }
+        out.push((v & 0x7F) as u8 | 0x80);
+        v >>= 7;
+    }
+}
+
+fn flush_insert_buf(out: &mut Vec<u8>, buf: &mut Vec<u8>) {
+    if buf.is_empty() { return; }
+    let mut pos = 0;
+    while pos < buf.len() {
+        let n = (buf.len() - pos).min(127);
+        out.push(n as u8);
+        out.extend_from_slice(&buf[pos..pos + n]);
+        pos += n;
+    }
+    buf.clear();
+}
+
+fn emit_copy(out: &mut Vec<u8>, offset: u64, size: u64) {
+    let o = offset;
+    let s = size;
+    let mut flags = 0u8;
+    let mut extra = [0u8; 7];
+    let mut n = 0usize;
+    for i in 0..4u64 {
+        let b = ((o >> (i * 8)) & 0xFF) as u8;
+        if b != 0 { flags |= 1 << i; extra[n] = b; n += 1; }
+    }
+    // Size: 0 means 0x10000 (65536); for sizes < 65536, encode normally
+    if s != 65536 {
+        for i in 0..3u64 {
+            let b = ((s >> (i * 8)) & 0xFF) as u8;
+            if b != 0 { flags |= 1 << (4 + i); extra[n] = b; n += 1; }
+        }
+    }
+    // If s == 65536, leave size bits as 0 → git interprets as 65536 (see pack-format)
+    out.push(0x80 | flags);
+    out.extend_from_slice(&extra[..n]);
 }
 
 // ─── Pack index v2 writer ─────────────────────────────────────────────────────
@@ -175,11 +415,9 @@ fn write_pack_index(
 ) -> Result<()> {
     let n = objects.len();
 
-    // Sort by SHA-1 (index requires lexicographic order)
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_unstable_by(|&a, &b| objects[a].sha1.cmp(&objects[b].sha1));
 
-    // Fan-out table: fanout[i] = count of objects with sha1[0] <= i (cumulative)
     let mut fanout = [0u32; 256];
     for &idx in &order {
         fanout[objects[idx].sha1[0] as usize] += 1;
@@ -190,31 +428,21 @@ fn write_pack_index(
         *entry = acc;
     }
 
-    // Buffer entire index in memory before writing (avoids many small writes)
-    // Size: 8 + 256*4 + n*(20+4+4) + (large offsets)*8 + 20 + 20
     let mut buf: Vec<u8> = Vec::with_capacity(8 + 1024 + n * 28 + 40);
 
-    // Magic + version 2
     buf.extend_from_slice(b"\xff\x74\x4f\x63");
     buf.extend_from_slice(&2u32.to_be_bytes());
 
-    // Fan-out table (256 × u32 big-endian)
     for &v in &fanout {
         buf.extend_from_slice(&v.to_be_bytes());
     }
-
-    // SHA-1 table (sorted)
     for &idx in &order {
         buf.extend_from_slice(&objects[idx].sha1);
     }
-
-    // CRC32 table (same order)
     for &idx in &order {
         buf.extend_from_slice(&objects[idx].crc32.to_be_bytes());
     }
 
-    // Offset table: 4-byte entry per object.
-    // If offset > 2^31-1 the high bit is set and the value indexes the large table.
     let mut large_offsets: Vec<u64> = Vec::new();
     for &idx in &order {
         let off = objects[idx].offset;
@@ -227,15 +455,12 @@ fn write_pack_index(
         }
     }
 
-    // Large offset table (8-byte big-endian, only if any offsets > 2 GiB)
     for &off in &large_offsets {
         buf.extend_from_slice(&off.to_be_bytes());
     }
 
-    // Pack SHA-1
     buf.extend_from_slice(pack_sha1);
 
-    // Index SHA-1 (SHA-1 of everything written above)
     let mut idx_hasher = Sha1::new();
     idx_hasher.update(&buf);
     buf.extend_from_slice(&idx_hasher.finish());
@@ -249,7 +474,7 @@ fn write_pack_index(
 // ─── Pack format helpers ──────────────────────────────────────────────────────
 
 /// Encode the pack object type+size header (variable-length).
-/// Format: first byte = [more:1][type:3][size_lo4:4], subsequent bytes [more:1][size_7:7].
+/// type values: 1=commit, 2=tree, 4=tag, 6=OFS_DELTA, 7=REF_DELTA
 fn pack_type_size(obj_type: u8, size: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(10);
     let mut rem = size >> 4;
@@ -265,13 +490,10 @@ fn pack_type_size(obj_type: u8, size: usize) -> Vec<u8> {
 
 // ─── zlib stored (level 0) ───────────────────────────────────────────────────
 
-/// Wrap `data` in zlib stored format (RFC 1950 + RFC 1951 BTYPE=00).
-/// No external dependencies: header, stored blocks, Adler-32 checksum.
-fn zlib_store(data: &[u8]) -> Vec<u8> {
-    // CMF=0x78 (CM=8, CINFO=7 → 32 K window)
-    // FLG=0x01: FLEVEL=0, FDICT=0, FCHECK=1 → (0x78*256 + 0x01) % 31 == 0 ✓
-    let n_blocks = data.len() / 65535 + 1;
-    let mut out = Vec::with_capacity(data.len() + 6 + n_blocks * 5);
+/// Append `data` in zlib stored format (RFC 1950 + RFC 1951 BTYPE=00) to `out`.
+fn zlib_store_into(out: &mut Vec<u8>, data: &[u8]) {
+    let n_blocks = if data.is_empty() { 1 } else { data.len().div_ceil(65535) };
+    out.reserve(data.len() + 6 + n_blocks * 5);
     out.extend_from_slice(&[0x78, 0x01]);
 
     if data.is_empty() {
@@ -290,13 +512,10 @@ fn zlib_store(data: &[u8]) -> Vec<u8> {
     }
 
     out.extend_from_slice(&adler32(data).to_be_bytes());
-    out
 }
 
 fn adler32(data: &[u8]) -> u32 {
     const MOD: u32 = 65521;
-    // Process in chunks of 5552 bytes — the max safe size without u32 overflow.
-    // This reduces modulo operations from 2N to 2*(N/5552), roughly 5500× fewer.
     let (mut s1, mut s2) = (1u32, 0u32);
     for chunk in data.chunks(5552) {
         for &b in chunk {

@@ -14,7 +14,7 @@ struct BlobShard {
 impl BlobShard {
     fn spawn(output_dir: &Path) -> Result<Self> {
         let mut child = Command::new("git")
-            .args(["-c", "pack.compression=0", "fast-import", "--done"])
+            .args(["-c", "pack.compression=1", "fast-import", "--done"])
             .current_dir(output_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())

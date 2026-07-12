@@ -124,8 +124,8 @@ impl TreeState {
                 encode_tree(&state.entries)
             };
 
-            // Write the tree object; returns its SHA-1
-            let oid = pack.write_object(2 /* tree */, &tree_bytes)?;
+            // Write the tree object with path-based delta compression
+            let oid = pack.write_tree(&tree_bytes, dir_path)?;
 
             // Cache the fresh OID
             self.dirs.get_mut(dir_path).unwrap().oid = Some(oid);

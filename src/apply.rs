@@ -46,7 +46,7 @@ pub struct Stats {
 /// in the linux alternates ODB — only shard-bound blobs need a clone.
 ///
 /// SHA-1 is computed via a single OpenSSL SHA-NI update on the contiguous
-/// buffer (2-3× faster than per-line updates for typical kernel line sizes).
+/// buffer (more efficient than per-line updates for typical kernel line sizes).
 fn collect_and_hash(mf: &ModifiedFile, buf: &mut Vec<u8>) -> git2::Oid {
     use openssl::sha::Sha1;
 
@@ -144,8 +144,7 @@ pub fn apply_blobs<'a>(
     // Tracks every blob SHA-1 we have already emitted or confirmed present.
     // Avoids re-emitting identical blob content seen earlier in the run.
     let mut blob_seen: HashSet<git2::Oid> = HashSet::new();
-    // Reusable content buffer: avoids per-blob allocation for alternates/deduped blobs.
-    // Only cloned for the ~45 % of blobs that must be sent to a shard fast-import.
+    // Reusable content buffer: filled once per blob; only cloned for the shard path.
     let mut content_buf: Vec<u8> = Vec::with_capacity(256 * 1024);
     let mut n_alternates: usize = 0;
     let mut n_deduped: usize = 0;
