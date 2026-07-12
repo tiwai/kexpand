@@ -20,35 +20,40 @@ slow for a large series.
 - Applying patches to an **in-memory file state** (no working-tree checkout needed)
 - Loading source files **lazily** from the upstream git tree via
   [git2](https://github.com/rust-lang/git2-rs)
-- Writing all commits in one pass with **`git fast-import`**
+- Writing blobs via **16 parallel `git fast-import`** processes
+- Writing trees and commits with a **native Rust pack writer** (no subprocess)
+- Merging all shard packs into one with a **Rust pack merger** (verbatim byte copy,
+  no decompression or recompression)
 - Sharing objects with the upstream repo via **git alternates** (minimal extra disk use)
 
-### Performance (SLE15-SP7, 60 857 patches)
+### Performance (SLE15-SP7, 60 888 patches)
 
 Default mode (one commit per patch):
 
 | Phase | Time |
 |---|---|
 | Read + parse patches | ~0.2 s |
-| Pre-load source files | ~1.2 s |
-| Apply patches + emit blobs | ~8.5 s |
-| Drain blob shards | ~2.2 s |
-| Emit commits (fast-import) | ~8.5 s |
-| Repack | ~10.4 s |
-| **Total** | **~31 s** |
+| Pre-load source files | ~1.3 s |
+| Apply patches + emit blobs | ~10 s |
+| Drain blob shards | ~2 s |
+| Emit commits (native Rust) | ~7.5 s |
+| Repack (Rust pack merger) | ~0.6 s |
+| **Total** | **~22 s** |
+
+Times measured on a 16-core AMD Ryzen AI 7 PRO with warm page cache.
+The apply phase is the dominant cost and is inherently serial (each patch
+must see the results of all prior patches).
 
 ### Performance tuning
 
 Two options offer large speedups at the cost of output fidelity.
 
-**`-R` / `--no-repack`** — skip delta-compression
+**`-R` / `--no-repack`** — skip pack merge
 
-The final `git repack` step delta-compresses the new objects so the repo is
-smaller and cheaper to clone or push.  For large series it is also the single
-longest phase.  Skipping it leaves the pack uncompressed, which costs extra
-disk space and makes some git operations slower, but is fine when you only
-need a quick look at the expanded tree or plan to run `git gc` later at your
-own convenience.
+The final repack step merges 17 separate pack files (16 blob shards + 1 commit
+pack) into one.  With the native Rust merger this takes only ~0.6 s, so skipping
+it saves little time.  The flag is mainly useful for debugging or when you intend
+to run `git gc` later.
 
 **`-1` / `--one-shot`** — single squashed commit
 
@@ -72,10 +77,10 @@ Combining both flags gives the fastest possible result:
 
 | Configuration | Time (SLE15-SP7) |
 |---|---|
-| Default | ~31 s |
+| Default | ~22 s |
 | `-R` (no repack) | ~21 s |
 | `-1` (one-shot) | ~5 s |
-| `-1 -R` | ~3 s |
+| `-1 -R` | ~4 s |
 
 ## Prerequisites
 
@@ -112,7 +117,7 @@ Options:
   -v, --verbose                    Print each patch as it is applied
       --dry-run                    Parse and apply in memory without writing git output
   -q, --quiet                      Suppress progress output
-  -R, --no-repack                  Skip the final git repack step
+  -R, --no-repack                  Skip the final pack merge step
       --repack-threads <THREADS>   Threads for git repack (0 = auto) [default: 0]
       --blob-shards <N>            Parallel blob fast-import processes (0 = auto) [default: 0]
   -1, --one-shot                   Squash all patches into a single commit
