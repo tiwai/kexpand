@@ -81,10 +81,20 @@ struct Cli {
     /// Squash all patches into a single commit instead of one commit per patch
     #[arg(short = '1', long)]
     one_shot: bool,
+
+    /// Change to <DIR> before doing anything (like make -C)
+    #[arg(short = 'C', long, value_name = "DIR")]
+    directory: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    if let Some(dir) = &cli.directory {
+        std::env::set_current_dir(dir)
+            .with_context(|| format!("changing directory to {}", dir.display()))?;
+    }
+
     let linux = cli.linux
         .context("--linux / $LINUX_GIT is required")?;
 

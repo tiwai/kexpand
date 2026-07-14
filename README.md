@@ -100,7 +100,8 @@ The binary is placed at `target/release/kexpand`.
 ## Usage
 
 `kexpand` must be run from the root of a kernel-source.git working tree (i.e. the
-branch you want to expand must be checked out there).
+branch you want to expand must be checked out there), or the `-C` option can be
+used to specify that directory instead.
 
 ```
 kexpand [OPTIONS] <OUTPUT>
@@ -111,6 +112,7 @@ Arguments:
 Options:
   -b, --branch <BRANCH>            Output branch name in the destination repo [default: master]
   -l, --linux <LINUX>              Upstream linux git repo (read-only) [$LINUX_GIT]
+  -C, --directory <DIR>            Change to DIR before doing anything (like make -C)
   -j, --jobs <JOBS>                Threads for parallel parsing (0 = auto) [default: 0]
       --max-fuzz <FUZZ>            Hunk fuzz level [default: 2]
       --skip-failed                Warn and skip patches that fail to apply
@@ -138,9 +140,21 @@ kexpand \
   --branch SLE15-SP7
 ```
 
-This reads `series.conf`, all patch files, and `rpm/config.sh` from the current
-working tree, then creates `~/git/suse-expanded` with a branch `SLE15-SP7`
-containing one commit per non-guarded patch.
+Or equivalently, using `-C` to avoid changing directory first:
+
+```sh
+git -C ~/kernel/suse/kernel-source checkout SLE15-SP7
+
+kexpand \
+  -C ~/kernel/suse/kernel-source \
+  --linux ~/git/linux \
+  ~/git/suse-expanded \
+  --branch SLE15-SP7
+```
+
+This reads `series.conf`, all patch files, and `rpm/config.sh` from the
+kernel-source working tree, then creates `~/git/suse-expanded` with a branch
+`SLE15-SP7` containing one commit per non-guarded patch.
 
 The output repo uses git alternates so it shares all upstream objects with the
 linux clone; only the new blobs and commit/tree objects are stored locally.
