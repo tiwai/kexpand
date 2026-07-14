@@ -274,6 +274,15 @@ pub fn encode_commit(
     if !meta.patch_mainline.is_empty() {
         extras.push_str(&format!("Patch-mainline: {}\n", meta.patch_mainline));
     }
+    if !meta.git_commit.is_empty() {
+        extras.push_str(&format!("Git-commit: {}\n", meta.git_commit));
+    }
+    if !meta.git_repo.is_empty() {
+        extras.push_str(&format!("Git-repo: {}\n", meta.git_repo));
+    }
+    if !meta.alt_commit.is_empty() {
+        extras.push_str(&format!("Alt-commit: {}\n", meta.alt_commit));
+    }
     if !extras.is_empty() {
         write!(s, "\n\n{extras}").unwrap();
     }

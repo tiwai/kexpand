@@ -427,6 +427,9 @@ pub fn apply_blobs_one_shot<'a>(
         subject: format!("Apply {} SUSE kernel patches", stats.applied),
         references: String::new(),
         patch_mainline: String::new(),
+        git_commit: String::new(),
+        git_repo: String::new(),
+        alt_commit: String::new(),
         body: String::new(),
     };
 

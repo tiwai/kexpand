@@ -14,6 +14,9 @@ pub struct PatchMeta {
     pub subject: String,
     pub references: String,
     pub patch_mainline: String,
+    pub git_commit: String,
+    pub git_repo: String,
+    pub alt_commit: String,
     /// Description body: text after the blank line following RFC 2822 headers,
     /// up to (but not including) the `---` separator line.
     pub body: String,
@@ -29,6 +32,9 @@ pub fn parse_header(raw: &[u8], source_path: PathBuf) -> PatchMeta {
     let mut subject = String::new();
     let mut references = String::new();
     let mut patch_mainline = String::new();
+    let mut git_commit = String::new();
+    let mut git_repo = String::new();
+    let mut alt_commit = String::new();
     let mut body = String::new();
 
     // Split into lines for header parsing
@@ -76,6 +82,15 @@ pub fn parse_header(raw: &[u8], source_path: PathBuf) -> PatchMeta {
         } else if line.starts_with(b"Patch-mainline:") {
             let val = header_value(line, b"Patch-mainline:");
             patch_mainline = to_str(val).trim().to_string();
+        } else if line.starts_with(b"Git-commit:") {
+            let val = header_value(line, b"Git-commit:");
+            git_commit = to_str(val).trim().to_string();
+        } else if line.starts_with(b"Git-repo:") {
+            let val = header_value(line, b"Git-repo:");
+            git_repo = to_str(val).trim().to_string();
+        } else if line.starts_with(b"Alt-commit:") {
+            let val = header_value(line, b"Alt-commit:");
+            alt_commit = to_str(val).trim().to_string();
         }
         i += 1;
     }
@@ -110,6 +125,9 @@ pub fn parse_header(raw: &[u8], source_path: PathBuf) -> PatchMeta {
         subject,
         references,
         patch_mainline,
+        git_commit,
+        git_repo,
+        alt_commit,
         body,
     }
 }
