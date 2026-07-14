@@ -1,0 +1,245 @@
+.TH KEXPAND 1 "2026-07-14" "kexpand 0.2.3" "User Commands"
+.SH NAME
+kexpand \- expand SUSE kernel-source patches into a Linux kernel git repository
+.SH SYNOPSIS
+.B kexpand
+[\fIOPTIONS\fR] \fI<OUTPUT>\fR
+.SH DESCRIPTION
+.B kexpand
+reads the \fIseries.conf\fR patch list and \fIrpm/config.sh\fR base-version
+declaration from a SUSE kernel-source.git working tree, applies every
+non-guarded patch to an in-memory file state, and writes one git commit
+per patch into the output repository.
+.PP
+The output repository is initialised with a git alternates link pointing at
+the upstream Linux git clone, so only new blobs, trees, and commits are stored
+locally; all upstream objects are shared read-only.
+.PP
+With
+.B \-\-one-shot
+a single squashed commit is written instead, containing only the final state
+of all modified files.  This is significantly faster but loses per-patch
+history.
+.PP
+.B kexpand
+must be run from the root of the kernel-source.git checkout, unless the
+.B \-C
+option is used to specify the directory explicitly.
+.SH ARGUMENTS
+.TP
+.I <OUTPUT>
+Path to the output git repository.  The directory is created and
+\fBgit init\fR is run if it does not already exist.
+.SH OPTIONS
+.TP
+.BI \-b " BRANCH" ", \-\-branch " BRANCH
+Name of the branch to create or update in the output repository.
+Default: \fBmaster\fR.
+.TP
+.BI \-l " LINUX" ", \-\-linux " LINUX
+Path to the upstream linux git clone (read-only access is sufficient).
+May also be supplied via the environment variable
+.BR LINUX_GIT .
+Either this option or
+.B LINUX_GIT
+is required.
+.TP
+.BI \-C " DIR" ", \-\-directory " DIR
+Change to
+.I DIR
+before doing anything, analogous to
+.BR "make \-C" .
+Without this option,
+.B kexpand
+must be run from the kernel-source.git working tree root.
+.TP
+.BI \-j " JOBS" ", \-\-jobs " JOBS
+Number of threads for parallel patch parsing.
+.B 0
+(the default) lets rayon choose automatically based on available CPUs.
+.TP
+.BI "\-\-max-fuzz " FUZZ
+Maximum context-line fuzz allowed when matching patch hunks.
+Default: \fB2\fR.
+.TP
+.B \-\-skip-failed
+Warn and skip patches that fail to apply instead of aborting.
+A diagnostic line is printed to stderr for each skipped patch.
+.TP
+.B \-v ", \-\-verbose"
+Print the path of each patch as it is applied.
+.TP
+.B \-\-dry-run
+Read, parse, and apply all patches in memory but skip writing any git output.
+Useful for testing patch applicability without creating the output repository.
+.TP
+.B \-q ", \-\-quiet"
+Suppress all progress output.
+.TP
+.B \-R ", \-\-no-repack"
+Skip the final pack-merge step.  The output repository will contain multiple
+pack files (blob shards plus a commit pack).  Saves roughly 0.6 s; mainly
+useful for debugging or when a subsequent
+.B git gc
+is planned.
+.TP
+.BI "\-\-blob-shards " N
+Number of parallel
+.B git fast-import
+processes used for writing blob objects.
+.B 0
+(the default) means min(available CPUs, 16).
+.TP
+.B \-1 ", \-\-one-shot"
+Apply all patches to the in-memory tree and emit a single squashed commit
+containing the final state of each modified file.  Much faster than the
+default one-commit-per-patch mode, but the resulting repository has no
+per-patch history.
+.TP
+.B \-h ", \-\-help"
+Print help and exit.
+.SH ENVIRONMENT
+.TP
+.B LINUX_GIT
+Path to the upstream linux git clone.  Used as the value of
+.B \-\-linux
+when that option is not given on the command line.
+.SH FILES
+.TP
+.B series.conf
+Ordered list of patches to apply.  Read from the kernel-source working tree
+root (or the directory given by
+.BR \-C ).
+Its presence is also used to validate that the working directory is correct.
+.TP
+.B rpm/config.sh
+Searched for a \fBSRCVERSION=\fR line that identifies the upstream kernel
+release tag (e.g.\& \fBSRCVERSION=6.4\fR maps to git tag \fBv6.4\fR).
+.TP
+.IB OUTPUT "/.git/objects/info/alternates"
+Written by
+.B kexpand
+to link the output repository to the upstream linux clone's object store.
+.TP
+.IB OUTPUT "/.git/objects/pack/pack-*.{pack,idx}"
+Pack files produced by
+.BR kexpand .
+Merged into a single pack at the end of the run unless
+.B \-R
+is used.
+.SH SERIES.CONF SYNTAX
+Each non-blank line of
+.I series.conf
+is interpreted as follows:
+.TP
+.RI "Leading " # " (after optional whitespace)"
+Comment — skipped.
+.TP
+.RI "Leading " + " or " \-
+Guarded — skipped unconditionally.
+.TP
+Otherwise
+Applied — the first whitespace-separated token is the patch file path
+relative to the kernel-source working tree root.
+.PP
+Patches are applied with strip level 1 (\fBpatch \-p1\fR).
+.SH COMMIT FORMAT
+In the default (one commit per patch) mode each commit records:
+.IP \(bu 4
+\fBauthor\fR: from the patch's \fBFrom:\fR (name and email) and \fBDate:\fR
+(RFC\ 2822) headers.
+.IP \(bu 4
+\fBcommitter\fR: \fBkexpand <kexpand@localhost>\fR with the current UTC time.
+.IP \(bu 4
+\fBsubject\fR: from the patch's \fBSubject:\fR header with any
+\fB[PATCH\ ...]\fR prefix stripped.
+.IP \(bu 4
+\fBbody\fR: the description text between the RFC\ 2822 headers and the
+\fB\-\-\-\fR separator.
+.IP \(bu 4
+\fBtrailers\fR appended to the body when present: \fBReferences:\fR,
+\fBPatch-mainline:\fR, \fBGit-commit:\fR, \fBGit-repo:\fR, \fBAlt-commit:\fR,
+and an \fBOriginal-patch:\fR trailer with the relative patch file path.
+.PP
+In
+.B \-\-one-shot
+mode a single commit is written with author and committer set to
+.B "kexpand <kexpand@localhost>"
+and subject \fBApply N SUSE kernel patches\fR.
+.SH NOTES
+Binary patches (\fBGIT binary patch\fR or \fBbinary\fR metadata) are silently
+skipped; a diagnostic line is printed to stderr.
+.PP
+Typical performance on SLE15-SP7 (60,888 patches) with a warm page cache on a
+16-core AMD Ryzen AI 7 PRO:
+.RS
+.PD 0
+.TP 32
+Default (one commit per patch)
+~22 s
+.TP
+.B \-R
+(skip repack) ~21 s
+.TP
+.B \-1
+(one-shot, single commit) ~5 s
+.TP
+.B "\-1 \-R"
+~4 s
+.PD
+.RE
+.SH EXAMPLES
+Expand all non-guarded patches from the SLE15-SP7 branch of a
+kernel-source checkout into a new output repository:
+.PP
+.RS
+.nf
+cd ~/kernel/suse/kernel-source
+git checkout SLE15-SP7
+kexpand \-\-linux ~/git/linux ~/git/suse-expanded \-\-branch SLE15-SP7
+.fi
+.RE
+.PP
+Same operation without changing the current directory:
+.PP
+.RS
+.nf
+git \-C ~/kernel/suse/kernel-source checkout SLE15-SP7
+kexpand \-C ~/kernel/suse/kernel-source \e
+        \-\-linux ~/git/linux       \e
+        ~/git/suse-expanded        \e
+        \-\-branch SLE15-SP7
+.fi
+.RE
+.PP
+Fastest mode — single squashed commit, no per-patch history:
+.PP
+.RS
+.nf
+kexpand \-C ~/kernel/suse/kernel-source \e
+        \-\-linux ~/git/linux           \e
+        ~/git/suse-expanded            \e
+        \-\-branch SLE15-SP7            \e
+        \-\-one-shot
+.fi
+.RE
+.PP
+Test patch applicability without writing any git objects:
+.PP
+.RS
+.nf
+kexpand \-C ~/kernel/suse/kernel-source \e
+        \-\-linux ~/git/linux           \e
+        /tmp/throwaway                 \e
+        \-\-dry-run
+.fi
+.RE
+.SH SEE ALSO
+.BR git (1),
+.BR git-fast-import (1),
+.BR patch (1),
+.BR quilt (1)
+.SH AUTHORS
+Written by Takashi Iwai.
+.SH LICENSE
+MIT License.
