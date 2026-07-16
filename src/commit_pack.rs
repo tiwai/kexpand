@@ -282,6 +282,10 @@ fn encode_ofs_back(mut ofs: u64) -> Vec<u8> {
 
 // ─── Git delta encoding ───────────────────────────────────────────────────────
 
+thread_local! {
+    static DELTA_TABLE_SCRATCH: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Produce a git-format binary delta that transforms `src` into `dst`.
 /// Output: src_size (varint) || dst_size (varint) || instructions
 ///
@@ -297,60 +301,69 @@ fn git_delta_encode(src: &[u8], dst: &[u8]) -> Vec<u8> {
     // Power-of-two table sized to ~src.len()/4; minimum 256 slots.
     let tsize = (src.len() / 4 + 1).next_power_of_two().max(256);
     let tmask = (tsize - 1) as u32;
-    let mut table = vec![0u32; tsize]; // 0 = empty; otherwise (pos+1)
 
-    // Build: stride=1, hash each BLOCK-byte window.  Last-write-wins on collision.
-    if src.len() >= BLOCK {
-        for i in 0..=src.len() - BLOCK {
-            let h = hash16(&src[i..i + BLOCK]) & tmask;
-            table[h as usize] = (i as u32) + 1;
+    DELTA_TABLE_SCRATCH.with(|scratch| {
+        let mut table_borrow = scratch.borrow_mut();
+        if table_borrow.len() < tsize {
+            table_borrow.resize(tsize, 0);
+        } else {
+            table_borrow[..tsize].fill(0);
         }
-    }
+        let table = &mut table_borrow[..tsize];
 
-    let mut out = Vec::with_capacity(dst.len() / 4 + 32);
-    write_delta_varint(&mut out, src.len());
-    write_delta_varint(&mut out, dst.len());
+        // Build: stride=1, hash each BLOCK-byte window.  Last-write-wins on collision.
+        if src.len() >= BLOCK {
+            for i in 0..=src.len() - BLOCK {
+                let h = hash16(&src[i..i + BLOCK]) & tmask;
+                table[h as usize] = (i as u32) + 1;
+            }
+        }
 
-    let mut dp = 0usize;
-    let mut insert_buf: Vec<u8> = Vec::with_capacity(128);
+        let mut out = Vec::with_capacity(dst.len() / 4 + 32);
+        write_delta_varint(&mut out, src.len());
+        write_delta_varint(&mut out, dst.len());
 
-    while dp < dst.len() {
-        let remaining = dst.len() - dp;
-        let mut matched = None;
+        let mut dp = 0usize;
+        let mut insert_buf: Vec<u8> = Vec::with_capacity(128);
 
-        if remaining >= BLOCK {
-            let h = hash16(&dst[dp..dp + BLOCK]) & tmask;
-            let slot = table[h as usize];
-            if slot > 0 {
-                let sp = (slot - 1) as usize;
-                if sp + BLOCK <= src.len() && src[sp..sp + BLOCK] == dst[dp..dp + BLOCK] {
-                    let max_fwd = (src.len() - sp).min(dst.len() - dp).min(0xFFFF);
-                    let mut len = BLOCK;
-                    while len < max_fwd && src[sp + len] == dst[dp + len] {
-                        len += 1;
+        while dp < dst.len() {
+            let remaining = dst.len() - dp;
+            let mut matched = None;
+
+            if remaining >= BLOCK {
+                let h = hash16(&dst[dp..dp + BLOCK]) & tmask;
+                let slot = table[h as usize];
+                if slot > 0 {
+                    let sp = (slot - 1) as usize;
+                    if sp + BLOCK <= src.len() && src[sp..sp + BLOCK] == dst[dp..dp + BLOCK] {
+                        let max_fwd = (src.len() - sp).min(dst.len() - dp).min(0xFFFF);
+                        let mut len = BLOCK;
+                        while len < max_fwd && src[sp + len] == dst[dp + len] {
+                            len += 1;
+                        }
+                        matched = Some((sp, len));
                     }
-                    matched = Some((sp, len));
                 }
             }
-        }
 
-        match matched {
-            Some((sp, len)) => {
-                flush_insert_buf(&mut out, &mut insert_buf);
-                emit_copy(&mut out, sp as u64, len as u64);
-                dp += len;
-            }
-            None => {
-                insert_buf.push(dst[dp]);
-                if insert_buf.len() == 127 {
+            match matched {
+                Some((sp, len)) => {
                     flush_insert_buf(&mut out, &mut insert_buf);
+                    emit_copy(&mut out, sp as u64, len as u64);
+                    dp += len;
                 }
-                dp += 1;
+                None => {
+                    insert_buf.push(dst[dp]);
+                    if insert_buf.len() == 127 {
+                        flush_insert_buf(&mut out, &mut insert_buf);
+                    }
+                    dp += 1;
+                }
             }
         }
-    }
-    flush_insert_buf(&mut out, &mut insert_buf);
-    out
+        flush_insert_buf(&mut out, &mut insert_buf);
+        out
+    })
 }
 
 fn hash16(data: &[u8]) -> u32 {
