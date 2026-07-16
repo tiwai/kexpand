@@ -38,6 +38,9 @@ pub struct Stats {
     pub skipped_error: usize,
 }
 
+static TIME_COLLECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TIME_HASH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Fill `buf` with the file content and return the git blob SHA-1.
 ///
 /// `buf` is a caller-supplied reusable Vec cleared and refilled each call.
@@ -48,13 +51,24 @@ pub struct Stats {
 /// buffer (more efficient than per-line updates for typical kernel line sizes).
 fn collect_and_hash(mf: &ModifiedFile, buf: &mut Vec<u8>) -> git2::Oid {
     use openssl::sha::Sha1;
+    use std::sync::atomic::Ordering;
 
-    // Refill the reusable buffer with direct extend (one copy per byte).
+    let t0 = std::time::Instant::now();
+    // Pre-calculate exact total length and reserve to avoid incremental reallocations and copies.
+    let total_len: usize = mf.content.iter().map(|line| line.len()).sum();
     buf.clear();
-    for line in &mf.content {
-        buf.extend_from_slice(line);
+    buf.reserve(total_len);
+    unsafe {
+        let mut ptr = buf.as_mut_ptr();
+        for line in &mf.content {
+            std::ptr::copy_nonoverlapping(line.as_ptr(), ptr, line.len());
+            ptr = ptr.add(line.len());
+        }
+        buf.set_len(total_len);
     }
+    TIME_COLLECT.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
+    let t1 = std::time::Instant::now();
     // Hash blob header + full buffer in two calls.
     let mut hasher = Sha1::new();
     let mut hdr = [0u8; 26];
@@ -73,7 +87,9 @@ fn collect_and_hash(mf: &ModifiedFile, buf: &mut Vec<u8>) -> git2::Oid {
     hasher.update(&hdr[..6 + nd]);
     hasher.update(buf);
 
-    git2::Oid::from_bytes(&hasher.finish()).expect("OpenSSL SHA-1 is 20 bytes")
+    let oid = git2::Oid::from_bytes(&hasher.finish()).expect("OpenSSL SHA-1 is 20 bytes");
+    TIME_HASH.fetch_add(t1.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    oid
 }
 
 /// Parse all patch files in parallel. `entries` is consumed (bytes moved into arena).
@@ -119,6 +135,32 @@ pub fn collect_patch_paths(parsed: &[ParsedPatch]) -> Vec<PathBuf> {
     seen.into_iter().collect()
 }
 
+struct PatchTask<'a> {
+    meta: PatchMeta,
+    file_tasks: Vec<FileTask<'a>>,
+    deleted_paths: Vec<PathBuf>,
+}
+
+struct FileTask<'a> {
+    target_path: PathBuf,
+    content: Vec<&'a [u8]>,
+    permissions_mode: Option<u32>,
+    default_mode: u32,
+}
+
+struct HashedBlob {
+    path: PathBuf,
+    oid: git2::Oid,
+    mode: u32,
+    content: Vec<u8>,
+}
+
+struct HashedPatch {
+    meta: PatchMeta,
+    blobs: Vec<HashedBlob>,
+    deleted: Vec<PathBuf>,
+}
+
 /// Apply all parsed patches serially, emitting blobs to `shard_pool`.
 /// Returns a `PatchResult` per applied patch (for later commit emission)
 /// and aggregate statistics.
@@ -133,136 +175,238 @@ pub fn apply_blobs<'a>(
     verbose: bool,
     quiet: bool,
 ) -> Result<(Vec<PatchResult>, Stats)> {
+    use rayon::prelude::*;
+
     let mut stats = Stats { applied: 0, skipped_binary: 0, skipped_error: 0 };
-    let mut results: Vec<PatchResult> = Vec::new();
     let analyses = AnalysisSet::default();
+
+    let mut results = Vec::with_capacity(parsed.len());
+    let blob_seen = std::sync::Mutex::new(HashSet::new());
+    let mut n_alternates: usize = 0;
+    let mut n_deduped: usize = 0;
 
     let mut t_hash_collect = std::time::Duration::ZERO;
     let mut t_odb = std::time::Duration::ZERO;
     let mut t_shard = std::time::Duration::ZERO;
-    // Tracks every blob SHA-1 we have already emitted or confirmed present.
-    // Avoids re-emitting identical blob content seen earlier in the run.
-    let mut blob_seen: HashSet<git2::Oid> = HashSet::new();
-    // Reusable content buffer: filled once per blob; only cloned for the shard path.
-    let mut content_buf: Vec<u8> = Vec::with_capacity(256 * 1024);
-    let mut n_alternates: usize = 0;
-    let mut n_deduped: usize = 0;
 
-    for pp in parsed {
-        let text_patch = match pp.text_patch {
-            None => {
-                eprintln!("SKIP (binary): {}", pp.meta.source_path.display());
-                stats.skipped_binary += 1;
+    let chunk_size = 4096;
+    let mut parsed_iter = parsed.into_iter();
+
+    loop {
+        let mut chunk = Vec::with_capacity(chunk_size);
+        for _ in 0..chunk_size {
+            if let Some(pp) = parsed_iter.next() {
+                chunk.push(pp);
+            } else {
+                break;
+            }
+        }
+        if chunk.is_empty() {
+            break;
+        }
+
+        // 1. Sequential Application on this chunk
+        let mut patch_tasks: Vec<PatchTask> = Vec::with_capacity(chunk.len());
+        for pp in chunk {
+            let text_patch = match pp.text_patch {
+                None => {
+                    eprintln!("SKIP (binary): {}", pp.meta.source_path.display());
+                    stats.skipped_binary += 1;
+                    continue;
+                }
+                Some(tp) => tp,
+            };
+
+            if verbose {
+                println!("  applying: {}", pp.meta.source_path.display());
+            }
+
+            let mut deleted_paths: Vec<PathBuf> = Vec::new();
+            let mut patch_failed = false;
+
+            for file_patch in &text_patch.file_patches {
+                let (lookup_key, _target_key) = resolve_paths(file_patch);
+
+                if !modified_files.contains_key(&lookup_key) {
+                    modified_files.insert(lookup_key.clone(), ModifiedFile::new_non_existent());
+                }
+                let mf = modified_files.get_mut(&lookup_key).unwrap();
+
+                let report = file_patch.apply(mf, PatchDirection::Forward, max_fuzz,
+                                               &analyses, &fn_analysis_note_noop);
+                if report.failed() {
+                    if skip_failed {
+                        eprintln!("WARN: hunk failed in {} (patch {})",
+                            lookup_key.display(), pp.meta.source_path.display());
+                        patch_failed = true;
+                    } else {
+                        bail!("hunk failed in '{}' while applying patch '{}'",
+                            lookup_key.display(), pp.meta.source_path.display());
+                    }
+                }
+
+                if file_patch.is_rename() {
+                    if let Some(new_fn) = file_patch.new_filename() {
+                        let new_key = new_fn.as_ref().to_path_buf();
+                        let mf_entry = modified_files.get_mut(&lookup_key).unwrap();
+                        let moved = mf_entry.move_out();
+                        deleted_paths.push(lookup_key.clone());
+                        modified_files.insert(new_key.clone(), moved);
+                    }
+                }
+            }
+
+            if patch_failed {
+                stats.skipped_error += 1;
                 continue;
             }
-            Some(tp) => tp,
-        };
 
-        if verbose {
-            println!("  applying: {}", pp.meta.source_path.display());
-        }
+            let mut file_tasks = Vec::with_capacity(text_patch.file_patches.len());
 
-        let mut blobs: Vec<BlobEntry> = Vec::new();
-        let mut deleted_paths: Vec<PathBuf> = Vec::new();
-        let mut patch_failed = false;
+            for file_patch in &text_patch.file_patches {
+                let (lookup_key, _) = resolve_paths(file_patch);
 
-        for file_patch in &text_patch.file_patches {
-            let (lookup_key, _target_key) = resolve_paths(file_patch);
-
-            if !modified_files.contains_key(&lookup_key) {
-                modified_files.insert(lookup_key.clone(), ModifiedFile::new_non_existent());
-            }
-            let mf = modified_files.get_mut(&lookup_key).unwrap();
-
-            let report = file_patch.apply(mf, PatchDirection::Forward, max_fuzz,
-                                           &analyses, &fn_analysis_note_noop);
-            if report.failed() {
-                if skip_failed {
-                    eprintln!("WARN: hunk failed in {} (patch {})",
-                        lookup_key.display(), pp.meta.source_path.display());
-                    patch_failed = true;
+                let target = if file_patch.is_rename() {
+                    file_patch.new_filename()
+                        .map(|p| p.as_ref().to_path_buf())
+                        .unwrap_or_else(|| lookup_key.clone())
                 } else {
-                    bail!("hunk failed in '{}' while applying patch '{}'",
-                        lookup_key.display(), pp.meta.source_path.display());
-                }
-            }
+                    lookup_key.clone()
+                };
 
-            if file_patch.is_rename() {
-                if let Some(new_fn) = file_patch.new_filename() {
-                    let new_key = new_fn.as_ref().to_path_buf();
-                    let mf_entry = modified_files.get_mut(&lookup_key).unwrap();
-                    let moved = mf_entry.move_out();
-                    deleted_paths.push(lookup_key.clone());
-                    modified_files.insert(new_key.clone(), moved);
-                }
-            }
-        }
+                let mf = match modified_files.get(&target) {
+                    Some(mf) => mf,
+                    None => continue,
+                };
 
-        if patch_failed {
-            stats.skipped_error += 1;
-            continue;
-        }
-
-        for file_patch in &text_patch.file_patches {
-            let (lookup_key, _) = resolve_paths(file_patch);
-
-            let target = if file_patch.is_rename() {
-                file_patch.new_filename()
-                    .map(|p| p.as_ref().to_path_buf())
-                    .unwrap_or_else(|| lookup_key.clone())
-            } else {
-                lookup_key.clone()
-            };
-
-            let mf = match modified_files.get(&target) {
-                Some(mf) => mf,
-                None => continue,
-            };
-
-            if mf.deleted {
-                if !deleted_paths.contains(&target) {
-                    deleted_paths.push(target);
-                }
-            } else {
-                let mode = match &mf.permissions {
-                    Some(p) => {
+                if mf.deleted {
+                    if !deleted_paths.contains(&target) {
+                        deleted_paths.push(target);
+                    }
+                } else {
+                    let permissions_mode = mf.permissions.as_ref().map(|p| {
                         use std::os::unix::fs::PermissionsExt;
                         p.mode()
+                    });
+                    let default_mode = mode_map.get(&target).copied().unwrap_or(0o100644);
+
+                    file_tasks.push(FileTask {
+                        target_path: target,
+                        content: mf.content.clone(),
+                        permissions_mode,
+                        default_mode,
+                    });
+                }
+            }
+
+            patch_tasks.push(PatchTask {
+                meta: pp.meta,
+                file_tasks,
+                deleted_paths,
+            });
+            stats.applied += 1;
+        }
+
+        // 2. Parallel Hashing on this chunk
+        let th = std::time::Instant::now();
+        let hashed_patches: Vec<HashedPatch> = patch_tasks
+            .into_par_iter()
+            .map_init(
+                || Vec::with_capacity(256 * 1024),
+                |content_buf, task| {
+                    use openssl::sha::Sha1;
+
+                    let mut blobs = Vec::with_capacity(task.file_tasks.len());
+                    for file_task in task.file_tasks {
+                        let mode = match file_task.permissions_mode {
+                            Some(m) => m,
+                            None => file_task.default_mode,
+                        };
+                        let mode = if mode & 0o111 != 0 { 0o100755 } else { 0o100644 };
+
+                        content_buf.clear();
+                        for line in &file_task.content {
+                            content_buf.extend_from_slice(line);
+                        }
+
+                        let mut hasher = Sha1::new();
+                        let mut hdr = [0u8; 26];
+                        hdr[..5].copy_from_slice(b"blob ");
+                        let mut n = content_buf.len();
+                        let mut digits = [0u8; 20];
+                        let mut nd = 0;
+                        loop {
+                            digits[nd] = b'0' + (n % 10) as u8;
+                            nd += 1;
+                            n /= 10;
+                            if n == 0 { break; }
+                        }
+                        for i in 0..nd { hdr[5 + i] = digits[nd - 1 - i]; }
+                        hdr[5 + nd] = 0;
+                        hasher.update(&hdr[..6 + nd]);
+                        hasher.update(content_buf);
+
+                        let oid = git2::Oid::from_bytes(&hasher.finish()).expect("OpenSSL SHA-1 is 20 bytes");
+
+                        // Fast thread-safe seen check
+                        let mut seen_guard = blob_seen.lock().unwrap();
+                        let seen = seen_guard.contains(&oid);
+                        let content = if seen {
+                            drop(seen_guard);
+                            Vec::new() // Already seen, no content buffer clone needed!
+                        } else {
+                            seen_guard.insert(oid);
+                            drop(seen_guard);
+                            content_buf.clone() // Clone only for the first occurrence of this blob
+                        };
+
+                        blobs.push(HashedBlob {
+                            path: file_task.target_path,
+                            oid,
+                            mode,
+                            content,
+                        });
                     }
-                    None => mode_map.get(&target).copied().unwrap_or(0o100644),
-                };
-                let mode = if mode & 0o111 != 0 { 0o100755 } else { 0o100644 };
+                    HashedPatch {
+                        meta: task.meta,
+                        blobs,
+                        deleted: task.deleted_paths,
+                    }
+                }
+            )
+            .collect();
+        t_hash_collect += th.elapsed();
 
-                // Collect into reusable buffer and hash (single SHA-NI update).
-                let th = std::time::Instant::now();
-                let oid = collect_and_hash(mf, &mut content_buf);
-                t_hash_collect += th.elapsed();
-
-                if blob_seen.contains(&oid) {
+        // 3. Sequential Post-processing on this chunk
+        for hp in hashed_patches {
+            let mut final_blobs = Vec::with_capacity(hp.blobs.len());
+            for hb in hp.blobs {
+                if hb.content.is_empty() {
                     n_deduped += 1;
                 } else {
-                    blob_seen.insert(oid);
                     let to = std::time::Instant::now();
-                    let in_linux = git_odb.exists(oid);
+                    let in_linux = git_odb.exists(hb.oid);
                     t_odb += to.elapsed();
                     if in_linux {
                         n_alternates += 1;
-                        // No allocation: blob is in linus alternates ODB.
                     } else {
-                        // Clone only for the shard path (~45 % of blobs).
                         let tc = std::time::Instant::now();
-                        shard_pool.emit_blob(content_buf.clone())
-                            .context("emitting blob to shard")?;
+                        shard_pool.emit_blob(hb.content)?;
                         t_shard += tc.elapsed();
                     }
                 }
-
-                blobs.push(BlobEntry { path: target, oid, mode });
+                final_blobs.push(BlobEntry {
+                    path: hb.path,
+                    oid: hb.oid,
+                    mode: hb.mode,
+                });
             }
+            results.push(PatchResult {
+                meta: hp.meta,
+                blobs: final_blobs,
+                deleted: hp.deleted,
+            });
         }
-
-        results.push(PatchResult { meta: pp.meta, blobs, deleted: deleted_paths });
-        stats.applied += 1;
     }
 
     if !quiet {

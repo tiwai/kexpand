@@ -8,7 +8,7 @@ use anyhow::{bail, Context, Result};
 struct BlobShard {
     tx: SyncSender<Vec<u8>>,
     writer_jh: JoinHandle<Result<()>>,
-    child: Child,
+    child: std::sync::Mutex<Child>,
 }
 
 impl BlobShard {
@@ -23,7 +23,7 @@ impl BlobShard {
             .context("spawning blob shard fast-import")?;
 
         let stdin = child.stdin.take().unwrap();
-        let (tx, rx) = sync_channel::<Vec<u8>>(512);
+        let (tx, rx) = sync_channel::<Vec<u8>>(4096);
 
         let writer_jh = std::thread::spawn(move || -> Result<()> {
             use std::io::{BufWriter, Write};
@@ -39,7 +39,7 @@ impl BlobShard {
             Ok(())
         });
 
-        Ok(BlobShard { tx, writer_jh, child })
+        Ok(BlobShard { tx, writer_jh, child: std::sync::Mutex::new(child) })
     }
 
     fn emit_blob(&self, content: Vec<u8>) -> Result<()> {
@@ -81,7 +81,7 @@ impl BlobShardPool {
         for shard in self.shards {
             txs.push(shard.tx);
             writer_jhs.push(shard.writer_jh);
-            children.push(shard.child);
+            children.push(shard.child.into_inner().unwrap());
         }
 
         // Drop all senders simultaneously → writer threads all see channel closed at once
