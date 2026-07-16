@@ -181,7 +181,10 @@ pub fn apply_blobs<'a>(
     let analyses = AnalysisSet::default();
 
     let mut results = Vec::with_capacity(parsed.len());
-    let blob_seen = std::sync::Mutex::new(HashSet::new());
+    // Create 256 sharded seen sets to eliminate parallel lock contention completely.
+    let blob_seen: Vec<std::sync::Mutex<HashSet<git2::Oid>>> = (0..256)
+        .map(|_| std::sync::Mutex::new(HashSet::new()))
+        .collect();
     let mut n_alternates: usize = 0;
     let mut n_deduped: usize = 0;
 
@@ -348,8 +351,9 @@ pub fn apply_blobs<'a>(
 
                         let oid = git2::Oid::from_bytes(&hasher.finish()).expect("OpenSSL SHA-1 is 20 bytes");
 
-                        // Fast thread-safe seen check
-                        let mut seen_guard = blob_seen.lock().unwrap();
+                        // Fast thread-safe seen check with sharding
+                        let shard_idx = oid.as_bytes()[0] as usize;
+                        let mut seen_guard = blob_seen[shard_idx].lock().unwrap();
                         let seen = seen_guard.contains(&oid);
                         let content = if seen {
                             drop(seen_guard);
