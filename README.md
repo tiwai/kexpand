@@ -34,11 +34,11 @@ Default mode (one commit per patch):
 |---|---|
 | Read + parse patches | ~0.2 s |
 | Pre-load source files | ~1.3 s |
-| Apply patches + emit blobs | ~10 s |
+| Apply patches + emit blobs | ~6.2 s |
 | Drain blob shards | ~2 s |
-| Emit commits (native Rust) | ~7.5 s |
-| Repack (Rust pack merger) | ~0.6 s |
-| **Total** | **~22 s** |
+| Emit commits (native Rust) | ~10.1 s |
+| Repack (Rust pack merger) | ~0.7 s |
+| **Total** | **~19 s** |
 
 Times measured on a 16-core AMD Ryzen AI 7 PRO with warm page cache.
 The apply phase is the dominant cost and is inherently serial (each patch
@@ -77,10 +77,10 @@ Combining both flags gives the fastest possible result:
 
 | Configuration | Time (SLE15-SP7) |
 |---|---|
-| Default | ~22 s |
-| `-R` (no repack) | ~21 s |
-| `-1` (one-shot) | ~5 s |
-| `-1 -R` | ~4 s |
+| Default | ~19 s |
+| `-R` (no repack) | ~18 s |
+| `-1` (one-shot) | ~3.4 s |
+| `-1 -R` | ~3.3 s |
 
 ## Prerequisites
 
