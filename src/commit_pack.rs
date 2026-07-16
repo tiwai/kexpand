@@ -112,31 +112,28 @@ impl CommitPackWriter {
         }
 
         // Try OFS_DELTA against the previous version of this path.
-        let try_delta = self.tree_cache.get(path).map(|e| {
-            (e.content.clone(), e.offset, e.depth)
-        });
-
-        let wrote_delta = if let Some((base_content, base_offset, base_depth)) = try_delta {
-            if base_depth < MAX_DELTA_DEPTH && base_offset > 0 {
-                let delta = git_delta_encode(&base_content, content);
+        let mut try_delta_info = None;
+        if let Some(entry) = self.tree_cache.get(path) {
+            if entry.depth < MAX_DELTA_DEPTH && entry.offset > 0 {
+                let delta = git_delta_encode(&entry.content, content);
                 // Use delta if it's meaningfully smaller than stored-format full object.
                 // Stored format overhead: 2 (zlib hdr) + 5 (block hdr) per 65535 bytes + 4 (adler32)
                 let full_stored_size = content.len() + 11
                     + (content.len() / 65535) * 5;
                 if delta.len() < full_stored_size {
-                    let back_offset = self.current_offset - base_offset;
-                    self.write_ofs_delta(&delta, back_offset, oid, content);
-                    let entry = self.tree_cache.get_mut(path).unwrap();
-                    entry.content = content.to_vec();
-                    entry.offset = self.objects.last().unwrap().offset;
-                    entry.depth = base_depth + 1;
-                    true
-                } else {
-                    false
+                    try_delta_info = Some((delta, entry.offset, entry.depth));
                 }
-            } else {
-                false
             }
+        }
+
+        let wrote_delta = if let Some((delta, base_offset, base_depth)) = try_delta_info {
+            let back_offset = self.current_offset - base_offset;
+            self.write_ofs_delta(&delta, back_offset, oid, content);
+            let entry = self.tree_cache.get_mut(path).unwrap();
+            entry.content = content.to_vec();
+            entry.offset = self.objects.last().unwrap().offset;
+            entry.depth = base_depth + 1;
+            true
         } else {
             false
         };

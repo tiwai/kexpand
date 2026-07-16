@@ -49,10 +49,8 @@ pub struct Stats {
 fn collect_and_hash(mf: &ModifiedFile, buf: &mut Vec<u8>) -> git2::Oid {
     use openssl::sha::Sha1;
 
-    // Precalculate total length and pre-allocate capacity to avoid dynamic reallocations.
-    let total_len: usize = mf.content.iter().map(|line| line.len()).sum();
+    // Refill the reusable buffer with direct extend (one copy per byte).
     buf.clear();
-    buf.reserve(total_len);
     for line in &mf.content {
         buf.extend_from_slice(line);
     }

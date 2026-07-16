@@ -79,40 +79,46 @@ impl TreeState {
 
     /// Record a blob add/modify at `path`.
     pub fn update(&mut self, path: &Path, oid: git2::Oid, mode: u32) -> Result<()> {
-        let (dir, name) = split_path(path)?;
-        let state = self.dirs.entry(dir.clone()).or_insert_with(|| DirState {
-            entries: Vec::new(),
-            oid: None,
-        });
+        let dir = path.parent().unwrap_or_else(|| Path::new(""));
+        let name = path.file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| anyhow::anyhow!("path has no filename: {}", path.display()))?;
+
+        let state = self.dirs.get_mut(dir)
+            .ok_or_else(|| anyhow::anyhow!("directory not found: {}", dir.display()))?;
         let target_is_tree = mode == 0o040000;
         match state.entries.binary_search_by(|(n, entry)| {
-            git_tree_cmp(n, entry.is_tree(), &name, target_is_tree)
+            git_tree_cmp(n, entry.is_tree(), name, target_is_tree)
         }) {
             Ok(idx) => {
                 state.entries[idx].1 = DirEntry { oid, filemode: mode };
             }
             Err(idx) => {
-                state.entries.insert(idx, (name, DirEntry { oid, filemode: mode }));
+                state.entries.insert(idx, (name.to_string(), DirEntry { oid, filemode: mode }));
             }
         }
-        self.mark_dirty(&dir);
+        self.mark_dirty(dir);
         Ok(())
     }
 
     /// Record a file deletion at `path`.
     pub fn delete(&mut self, path: &Path) -> Result<()> {
-        let (dir, name) = split_path(path)?;
-        if let Some(state) = self.dirs.get_mut(&dir) {
+        let dir = path.parent().unwrap_or_else(|| Path::new(""));
+        let name = path.file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| anyhow::anyhow!("path has no filename: {}", path.display()))?;
+
+        if let Some(state) = self.dirs.get_mut(dir) {
             let idx = state.entries.binary_search_by(|(n, entry)| {
-                git_tree_cmp(n, entry.is_tree(), &name, false)
+                git_tree_cmp(n, entry.is_tree(), name, false)
             }).or_else(|_| {
                 state.entries.binary_search_by(|(n, entry)| {
-                    git_tree_cmp(n, entry.is_tree(), &name, true)
+                    git_tree_cmp(n, entry.is_tree(), name, true)
                 })
             });
             if let Ok(idx) = idx {
                 state.entries.remove(idx);
-                self.mark_dirty(&dir);
+                self.mark_dirty(dir);
             }
         }
         Ok(())
@@ -150,11 +156,8 @@ impl TreeState {
 
             // Update this directory's entry in its parent
             if let Some(dir_name) = dir_path.file_name().and_then(|n| n.to_str()) {
-                let parent = parent_path(dir_path);
-                let parent_state = self.dirs.entry(parent).or_insert_with(|| DirState {
-                    entries: Vec::new(),
-                    oid: None,
-                });
+                let parent = dir_path.parent().unwrap_or_else(|| Path::new(""));
+                let parent_state = self.dirs.get_mut(parent).unwrap();
                 let dir_name_string = dir_name.to_string();
                 match parent_state.entries.binary_search_by(|(n, entry)| {
                     git_tree_cmp(n, entry.is_tree(), &dir_name_string, true)
@@ -180,22 +183,20 @@ impl TreeState {
     /// Mark `start` and all its ancestor directories as dirty (oid = None).
     /// Stops early if an ancestor is already in `dirty` (implies all higher dirs are too).
     fn mark_dirty(&mut self, start: &Path) {
-        let mut current = start.to_path_buf();
+        let mut current = start;
         loop {
-            // Check membership *before* moving current into the set.
-            // We cannot use oid.is_none() as the stop condition because new
-            // directories (absent from the base tree) start with oid=None but
-            // have never been inserted into `dirty`, so their ancestors haven't
-            // been marked yet.
-            let already_dirty = self.dirty.contains(&current);
-            if let Some(state) = self.dirs.get_mut(&current) {
+            let already_dirty = self.dirty.contains(current);
+            if let Some(state) = self.dirs.get_mut(current) {
                 state.oid = None;
             }
-            let at_root = current == PathBuf::new();
-            let next = if at_root { PathBuf::new() } else { parent_path(&current) };
-            self.dirty.insert(current); // move (no clone)
-            if at_root || already_dirty { return; }
-            current = next;
+            if already_dirty {
+                return;
+            }
+            self.dirty.insert(current.to_path_buf());
+            if current == Path::new("") {
+                return;
+            }
+            current = current.parent().unwrap_or_else(|| Path::new(""));
         }
     }
 }
@@ -257,19 +258,24 @@ pub fn encode_commit(
         writeln!(s, "parent {p}").unwrap();
     }
 
-    // Sanitize name and email (fast-import forbids '<' and '>')
-    let name: String = if meta.author_name.is_empty() {
-        "Unknown".to_string()
+    // Sanitize name and email (fast-import forbids '<' and '>') directly into s
+    s.push_str("author ");
+    if meta.author_name.is_empty() {
+        s.push_str("Unknown");
+    } else if meta.author_name.contains('<') || meta.author_name.contains('>') {
+        s.extend(meta.author_name.chars().filter(|&c| c != '<' && c != '>'));
     } else {
-        meta.author_name.chars().filter(|&c| c != '<' && c != '>').collect()
-    };
-    let email: String = if meta.author_email.is_empty() {
-        "unknown@unknown".to_string()
+        s.push_str(&meta.author_name);
+    }
+    s.push_str(" <");
+    if meta.author_email.is_empty() {
+        s.push_str("unknown@unknown");
+    } else if meta.author_email.contains('<') || meta.author_email.contains('>') {
+        s.extend(meta.author_email.chars().filter(|&c| c != '<' && c != '>'));
     } else {
-        meta.author_email.chars().filter(|&c| c != '<' && c != '>').collect()
-    };
-
-    writeln!(s, "author {name} <{email}> {} {}", meta.author_timestamp, meta.author_tz).unwrap();
+        s.push_str(&meta.author_email);
+    }
+    writeln!(s, "> {} {}", meta.author_timestamp, meta.author_tz).unwrap();
     writeln!(s, "committer kexpand <kexpand@localhost> {committer_timestamp} +0000").unwrap();
     writeln!(s).unwrap();
 
@@ -381,30 +387,12 @@ fn ancestors_including_self(path: &Path, set: &mut HashSet<PathBuf>) {
             if !new || current == PathBuf::new() {
                 break;
             }
-            current = parent_path(&current);
+            current = match current.parent() {
+                Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+                _ => PathBuf::new(),
+            };
         }
     } else {
         set.insert(PathBuf::new());
     }
-}
-
-/// Return the parent directory of `path`, or `PathBuf::new()` for root.
-fn parent_path(path: &Path) -> PathBuf {
-    match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-        _ => PathBuf::new(),
-    }
-}
-
-/// Split `path` into `(parent_dir, filename)`.
-fn split_path(path: &Path) -> Result<(PathBuf, String)> {
-    let name = path.file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| anyhow::anyhow!("path has no filename: {}", path.display()))?
-        .to_string();
-    let dir = match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-        _ => PathBuf::new(),
-    };
-    Ok((dir, name))
 }
