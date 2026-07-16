@@ -180,12 +180,13 @@ fn main() -> Result<()> {
     let mut shard_pool = BlobShardPool::new(&cli.output, n_shards)?;
     let t_apply = Instant::now();
     if !cli.quiet { println!("Applying patches..."); }
+    let git_odb = git_source.repo().odb().context("opening upstream odb")?;
     let (patch_results, stats) = if cli.one_shot {
         let (mut result, stats) = apply_blobs_one_shot(
             parsed,
             pre_files,
             mode_map,
-            &git_source,
+            &git_odb,
             &mut shard_pool,
             cli.max_fuzz,
             cli.skip_failed,
@@ -199,7 +200,7 @@ fn main() -> Result<()> {
             parsed,
             pre_files,
             mode_map,
-            &git_source,
+            &git_odb,
             &mut shard_pool,
             cli.max_fuzz,
             cli.skip_failed,

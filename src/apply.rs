@@ -9,7 +9,6 @@ use libpatch::patch::{PatchDirection, TextFilePatch, TextPatch};
 
 use crate::arena::ByteArena;
 use crate::blob_shards::BlobShardPool;
-use crate::git_source::GitSource;
 use crate::patch_header::{parse_header, PatchMeta};
 
 #[derive(Clone)]
@@ -50,8 +49,10 @@ pub struct Stats {
 fn collect_and_hash(mf: &ModifiedFile, buf: &mut Vec<u8>) -> git2::Oid {
     use openssl::sha::Sha1;
 
-    // Refill the reusable buffer with direct extend (one copy per byte).
+    // Precalculate total length and pre-allocate capacity to avoid dynamic reallocations.
+    let total_len: usize = mf.content.iter().map(|line| line.len()).sum();
     buf.clear();
+    buf.reserve(total_len);
     for line in &mf.content {
         buf.extend_from_slice(line);
     }
@@ -127,7 +128,7 @@ pub fn apply_blobs<'a>(
     parsed: Vec<ParsedPatch<'a>>,
     mut modified_files: HashMap<PathBuf, ModifiedFile<'a>>,
     mode_map: HashMap<PathBuf, u32>,
-    git_source: &GitSource,
+    git_odb: &git2::Odb,
     shard_pool: &mut BlobShardPool,
     max_fuzz: usize,
     skip_failed: bool,
@@ -244,7 +245,7 @@ pub fn apply_blobs<'a>(
                 } else {
                     blob_seen.insert(oid);
                     let to = std::time::Instant::now();
-                    let in_linux = git_source.blob_exists(oid);
+                    let in_linux = git_odb.exists(oid);
                     t_odb += to.elapsed();
                     if in_linux {
                         n_alternates += 1;
@@ -282,7 +283,7 @@ pub fn apply_blobs_one_shot<'a>(
     parsed: Vec<ParsedPatch<'a>>,
     mut modified_files: HashMap<PathBuf, ModifiedFile<'a>>,
     mode_map: HashMap<PathBuf, u32>,
-    git_source: &GitSource,
+    git_odb: &git2::Odb,
     shard_pool: &mut BlobShardPool,
     max_fuzz: usize,
     skip_failed: bool,
@@ -391,7 +392,7 @@ pub fn apply_blobs_one_shot<'a>(
             n_deduped += 1;
         } else {
             blob_seen.insert(oid);
-            let in_linux = git_source.blob_exists(oid);
+            let in_linux = git_odb.exists(oid);
             if in_linux {
                 n_alternates += 1;
             } else {

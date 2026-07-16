@@ -39,13 +39,6 @@ impl GitSource {
         &self.commit_sha1
     }
 
-    /// Check whether a blob object exists in this repo (including alternates).
-    pub fn blob_exists(&self, oid: git2::Oid) -> bool {
-        self.repo.odb()
-            .map(|odb| odb.exists(oid))
-            .unwrap_or(false)
-    }
-
     /// Load content and file mode for a batch of paths in parallel.
     /// Returns (path, content_or_none, mode) for each input path.
     /// Paths not found in the tree return (path, None, 0o100644).

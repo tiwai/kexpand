@@ -24,7 +24,7 @@ impl DirEntry {
 }
 
 struct DirState {
-    entries: HashMap<String, DirEntry>,
+    entries: Vec<(String, DirEntry)>,
     /// Cached tree OID for this directory; `None` means dirty (needs rebuild).
     oid: Option<git2::Oid>,
 }
@@ -81,10 +81,20 @@ impl TreeState {
     pub fn update(&mut self, path: &Path, oid: git2::Oid, mode: u32) -> Result<()> {
         let (dir, name) = split_path(path)?;
         let state = self.dirs.entry(dir.clone()).or_insert_with(|| DirState {
-            entries: HashMap::new(),
+            entries: Vec::new(),
             oid: None,
         });
-        state.entries.insert(name, DirEntry { oid, filemode: mode });
+        let target_is_tree = mode == 0o040000;
+        match state.entries.binary_search_by(|(n, entry)| {
+            git_tree_cmp(n, entry.is_tree(), &name, target_is_tree)
+        }) {
+            Ok(idx) => {
+                state.entries[idx].1 = DirEntry { oid, filemode: mode };
+            }
+            Err(idx) => {
+                state.entries.insert(idx, (name, DirEntry { oid, filemode: mode }));
+            }
+        }
         self.mark_dirty(&dir);
         Ok(())
     }
@@ -93,7 +103,15 @@ impl TreeState {
     pub fn delete(&mut self, path: &Path) -> Result<()> {
         let (dir, name) = split_path(path)?;
         if let Some(state) = self.dirs.get_mut(&dir) {
-            if state.entries.remove(&name).is_some() {
+            let idx = state.entries.binary_search_by(|(n, entry)| {
+                git_tree_cmp(n, entry.is_tree(), &name, false)
+            }).or_else(|_| {
+                state.entries.binary_search_by(|(n, entry)| {
+                    git_tree_cmp(n, entry.is_tree(), &name, true)
+                })
+            });
+            if let Ok(idx) = idx {
+                state.entries.remove(idx);
                 self.mark_dirty(&dir);
             }
         }
@@ -134,13 +152,20 @@ impl TreeState {
             if let Some(dir_name) = dir_path.file_name().and_then(|n| n.to_str()) {
                 let parent = parent_path(dir_path);
                 let parent_state = self.dirs.entry(parent).or_insert_with(|| DirState {
-                    entries: HashMap::new(),
+                    entries: Vec::new(),
                     oid: None,
                 });
-                parent_state.entries.insert(
-                    dir_name.to_string(),
-                    DirEntry { oid, filemode: 0o040000 },
-                );
+                let dir_name_string = dir_name.to_string();
+                match parent_state.entries.binary_search_by(|(n, entry)| {
+                    git_tree_cmp(n, entry.is_tree(), &dir_name_string, true)
+                }) {
+                    Ok(idx) => {
+                        parent_state.entries[idx].1 = DirEntry { oid, filemode: 0o040000 };
+                    }
+                    Err(idx) => {
+                        parent_state.entries.insert(idx, (dir_name_string, DirEntry { oid, filemode: 0o040000 }));
+                    }
+                }
                 // Parent was already marked dirty via mark_dirty(); keep oid=None
                 parent_state.oid = None;
             }
@@ -177,13 +202,9 @@ impl TreeState {
 
 // ─── Tree encoding ────────────────────────────────────────────────────────────
 
-fn encode_tree(entries: &HashMap<String, DirEntry>) -> Vec<u8> {
-    let mut sorted: Vec<(&str, &DirEntry)> =
-        entries.iter().map(|(k, v)| (k.as_str(), v)).collect();
-    sorted.sort_by(|(na, a), (nb, b)| git_tree_cmp(na, a.is_tree(), nb, b.is_tree()));
-
-    let mut buf = Vec::with_capacity(sorted.len() * 32);
-    for (name, entry) in sorted {
+fn encode_tree(entries: &[(String, DirEntry)]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(entries.len() * 32);
+    for (name, entry) in entries {
         buf.extend_from_slice(mode_str(entry.filemode).as_bytes());
         buf.push(b' ');
         buf.extend_from_slice(name.as_bytes());
@@ -308,7 +329,7 @@ fn load_dir_entries(
     repo: &git2::Repository,
     base_tree_oid: git2::Oid,
     dir_path: &Path,
-) -> Result<(HashMap<String, DirEntry>, Option<git2::Oid>)> {
+) -> Result<(Vec<(String, DirEntry)>, Option<git2::Oid>)> {
     let mut current_oid = base_tree_oid;
 
     // Walk down the tree one component at a time
@@ -324,23 +345,24 @@ fn load_dir_entries(
             .map(|e| e.id());
         match child_oid {
             Some(oid) => current_oid = oid,
-            None => return Ok((HashMap::new(), None)), // dir absent from base
+            None => return Ok((Vec::new(), None)), // dir absent from base
         }
     }
 
     let tree = repo.find_tree(current_oid)?;
     let tree_oid = Some(tree.id());
-    let mut entries = HashMap::new();
+    let mut entries = Vec::with_capacity(tree.len());
     for entry in tree.iter() {
         let name = match entry.name() {
             Ok(n) if !n.is_empty() => n.to_string(),
             _ => continue,
         };
-        entries.insert(name, DirEntry {
+        entries.push((name, DirEntry {
             oid: entry.id(),
             filemode: entry.filemode_raw() as u32,
-        });
+        }));
     }
+    entries.sort_unstable_by(|(na, a), (nb, b)| git_tree_cmp(na, a.is_tree(), nb, b.is_tree()));
     Ok((entries, tree_oid))
 }
 
