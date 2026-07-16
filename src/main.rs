@@ -555,6 +555,21 @@ fn write_merged_index(
 fn init_output_repo(output: &std::path::Path, linux: &std::path::Path, quiet: bool) -> Result<()> {
     if output.exists() {
         if !quiet { println!("Output repo exists, using it"); }
+        // Clean out any old packfiles and idx files to prevent duplicate object bloat and corruption
+        let pack_dir = output.join(".git/objects/pack");
+        if pack_dir.exists() {
+            for entry in std::fs::read_dir(&pack_dir).context("reading pack dir")? {
+                let entry = entry.context("reading pack dir entry")?;
+                let path = entry.path();
+                if path.is_file() {
+                    let ext = path.extension().and_then(|s| s.to_str());
+                    if ext == Some("pack") || ext == Some("idx") {
+                        std::fs::remove_file(&path)
+                            .with_context(|| format!("removing stale packfile {}", path.display()))?;
+                    }
+                }
+            }
+        }
         return Ok(());
     }
 
