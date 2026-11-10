@@ -1,6 +1,6 @@
 [package]
 name = "kexpand"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2021"
 license = "MIT"
 description = "Expand SUSE kernel-source.git patches into a Linux kernel git repository"
