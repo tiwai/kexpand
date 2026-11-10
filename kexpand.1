@@ -21,6 +21,13 @@ a single squashed commit is written instead, containing only the final state
 of all modified files.  This is significantly faster but loses per-patch
 history.
 .PP
+With
+.B \-\-update
+the output repository must already be an expanded repository whose commits carry
+a \fBsuse-commit:\fR trailer.  New commits are appended on top of it, one per
+kernel-source commit (see
+.BR "UPDATE MODE" ).
+.PP
 .B kexpand
 must be run from the root of the kernel-source.git checkout, unless the
 .B \-C
@@ -29,7 +36,9 @@ option is used to specify the directory explicitly.
 .TP
 .I <OUTPUT>
 Path to the output git repository.  The directory is created and
-\fBgit init\fR is run if it does not already exist.
+\fBgit init\fR is run if it does not already exist.  With
+.B \-\-update
+it must already exist.
 .SH OPTIONS
 .TP
 .BI \-b " BRANCH" ", \-\-branch " BRANCH
@@ -95,6 +104,38 @@ Apply all patches to the in-memory tree and emit a single squashed commit
 containing the final state of each modified file.  Much faster than the
 default one-commit-per-patch mode, but the resulting repository has no
 per-patch history.
+.TP
+.B \-\-update
+Incremental mode: add commits on top of an existing expanded repository instead of
+expanding from scratch.  Cannot be combined with
+.B \-1
+or
+.BR \-\-dry-run .
+Existing packs in
+.I OUTPUT
+are left untouched.  Without
+.B \-\-blob-shards
+at most 4 shards are used.
+.TP
+.BI "\-\-base " REV
+With
+.BR \-\-update :
+commit-ish in
+.I OUTPUT
+to build on.  Its \fBsuse-commit:\fR trailer names the kernel-source commit already
+expanded.  Default: the branch given by
+.BR \-b .
+.TP
+.BI "\-\-rev " REV
+With
+.BR \-\-update :
+kernel-source revision to expand up to.  Default: \fBHEAD\fR of the kernel-source
+repository.
+.TP
+.B \-\-force
+With
+.BR \-\-update :
+allow moving the branch to a commit that does not descend from its current value.
 .TP
 .B \-h ", \-\-help"
 Print help and exit.
@@ -166,6 +207,23 @@ In
 mode a single commit is written with author and committer set to
 .B "kexpand <kexpand@localhost>"
 and subject \fBApply N SUSE kernel patches\fR.
+.SH UPDATE MODE
+.B \-\-update
+expands every kernel-source commit in \fIREV\fR not reachable from the base
+commit's \fBsuse-commit:\fR, parents first.  Kernel-source commits without
+\fIseries.conf\fR (e.g. the scripts branch) are not expanded and are dropped from
+the parent lists, so merges keep the structure of the kernel-source history.
+.PP
+Each new commit copies the \fBauthor\fR and \fBcommitter\fR lines and the message
+of the kernel-source commit, followed by a blank line and
+\fBsuse-commit: \fR\fIsha\fR.  Commits that do not change the expanded tree are
+still created.
+.PP
+Only files touched by patches that were added, removed, modified or reordered
+between a commit and its parent are recomputed; all other files are taken from the
+parent's expanded tree.  Patches and \fIseries.conf\fR are read from kernel-source
+git objects, not from the working tree.  The branch is updated only after all
+objects are written, and only the packs created by the run are merged.
 .SH NOTES
 Binary patches (\fBGIT binary patch\fR or \fBbinary\fR metadata) are silently
 skipped; a diagnostic line is printed to stderr.
@@ -232,6 +290,16 @@ kexpand \-C ~/kernel/suse/kernel-source \e
         \-\-linux ~/git/linux           \e
         /tmp/throwaway                 \e
         \-\-dry-run
+.fi
+.RE
+.PP
+Bring an existing expanded repository up to date with the checked-out
+kernel-source branch:
+.PP
+.RS
+.nf
+kexpand \-C ~/kernel/suse/kernel-source \-\-update \e
+        \-b SLE15-SP7 ~/kernel/suse/expand/kernel
 .fi
 .RE
 .SH SEE ALSO
