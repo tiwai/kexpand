@@ -19,6 +19,11 @@ impl GitSource {
         &self.repo
     }
 
+    /// Root tree OID of the base commit.
+    pub fn tree_oid(&self) -> Oid {
+        self.tree_oid
+    }
+
     pub fn new(linux: &Path, base_tag: &str) -> Result<Self> {
         let repo = Repository::open(linux)
             .with_context(|| format!("opening git repo: {}", linux.display()))?;

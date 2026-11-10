@@ -49,7 +49,7 @@ static TIME_HASH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 ///
 /// SHA-1 is computed via a single OpenSSL SHA-NI update on the contiguous
 /// buffer (more efficient than per-line updates for typical kernel line sizes).
-fn collect_and_hash(mf: &ModifiedFile, buf: &mut Vec<u8>) -> git2::Oid {
+pub fn collect_and_hash(mf: &ModifiedFile, buf: &mut Vec<u8>) -> git2::Oid {
     use openssl::sha::Sha1;
     use std::sync::atomic::Ordering;
 
@@ -459,43 +459,11 @@ pub fn apply_blobs_one_shot<'a>(
             println!("  applying: {}", pp.meta.source_path.display());
         }
 
-        let mut patch_failed = false;
-
-        for file_patch in &text_patch.file_patches {
-            let (lookup_key, _target_key) = resolve_paths(file_patch);
-
-            if !modified_files.contains_key(&lookup_key) {
-                modified_files.insert(lookup_key.clone(), ModifiedFile::new_non_existent());
-            }
-            let mf = modified_files.get_mut(&lookup_key).unwrap();
-
-            let report = file_patch.apply(mf, PatchDirection::Forward, max_fuzz,
-                                           &analyses, &fn_analysis_note_noop);
-            if report.failed() {
-                if skip_failed {
-                    eprintln!("WARN: hunk failed in {} (patch {})",
-                        lookup_key.display(), pp.meta.source_path.display());
-                    patch_failed = true;
-                } else {
-                    bail!("hunk failed in '{}' while applying patch '{}'",
-                        lookup_key.display(), pp.meta.source_path.display());
-                }
-            }
-
-            if file_patch.is_rename() {
-                if let Some(new_fn) = file_patch.new_filename() {
-                    let new_key = new_fn.as_ref().to_path_buf();
-                    let mf_entry = modified_files.get_mut(&lookup_key).unwrap();
-                    let moved = mf_entry.move_out();
-                    rename_sources.insert(lookup_key.clone());
-                    touched_paths.remove(&lookup_key);
-                    modified_files.insert(new_key.clone(), moved);
-                    touched_paths.insert(new_key);
-                }
-            } else {
-                touched_paths.insert(lookup_key);
-            }
-        }
+        let patch_failed = apply_file_patches(
+            &text_patch, &pp.meta, &mut modified_files, None,
+            &mut touched_paths, &mut rename_sources,
+            max_fuzz, skip_failed, &analyses,
+        )?;
 
         if patch_failed {
             stats.skipped_error += 1;
@@ -583,8 +551,68 @@ pub fn apply_blobs_one_shot<'a>(
     Ok((PatchResult { meta, blobs, deleted }, stats))
 }
 
+/// Apply the file patches of one patch to `modified_files`, restricted to files whose
+/// lookup key is in `filter` (all files if `None`).  Tracks touched paths and rename
+/// sources.  Returns true if a hunk failed and `skip_failed` suppressed the error.
+pub fn apply_file_patches<'a>(
+    text_patch: &TextPatch<'a>,
+    meta: &PatchMeta,
+    modified_files: &mut HashMap<PathBuf, ModifiedFile<'a>>,
+    filter: Option<&HashSet<PathBuf>>,
+    touched_paths: &mut HashSet<PathBuf>,
+    rename_sources: &mut HashSet<PathBuf>,
+    max_fuzz: usize,
+    skip_failed: bool,
+    analyses: &AnalysisSet,
+) -> Result<bool> {
+    let mut patch_failed = false;
+
+    for file_patch in &text_patch.file_patches {
+        let (lookup_key, _target_key) = resolve_paths(file_patch);
+        if let Some(f) = filter {
+            if !f.contains(&lookup_key) {
+                continue;
+            }
+        }
+
+        if !modified_files.contains_key(&lookup_key) {
+            modified_files.insert(lookup_key.clone(), ModifiedFile::new_non_existent());
+        }
+        let mf = modified_files.get_mut(&lookup_key).unwrap();
+
+        let report = file_patch.apply(mf, PatchDirection::Forward, max_fuzz,
+                                       analyses, &fn_analysis_note_noop);
+        if report.failed() {
+            if skip_failed {
+                eprintln!("WARN: hunk failed in {} (patch {})",
+                    lookup_key.display(), meta.source_path.display());
+                patch_failed = true;
+            } else {
+                bail!("hunk failed in '{}' while applying patch '{}'",
+                    lookup_key.display(), meta.source_path.display());
+            }
+        }
+
+        if file_patch.is_rename() {
+            if let Some(new_fn) = file_patch.new_filename() {
+                let new_key = new_fn.as_ref().to_path_buf();
+                let mf_entry = modified_files.get_mut(&lookup_key).unwrap();
+                let moved = mf_entry.move_out();
+                rename_sources.insert(lookup_key.clone());
+                touched_paths.remove(&lookup_key);
+                modified_files.insert(new_key.clone(), moved);
+                touched_paths.insert(new_key);
+            }
+        } else {
+            touched_paths.insert(lookup_key);
+        }
+    }
+
+    Ok(patch_failed)
+}
+
 /// Determine the lookup key (for HashMap) and target key (for output).
-fn resolve_paths(file_patch: &TextFilePatch) -> (PathBuf, PathBuf) {
+pub fn resolve_paths(file_patch: &TextFilePatch) -> (PathBuf, PathBuf) {
     match (file_patch.old_filename(), file_patch.new_filename()) {
         (Some(old), Some(new)) if file_patch.is_rename() => {
             (strip_quilt_backup(old.as_ref()), new.as_ref().to_path_buf())

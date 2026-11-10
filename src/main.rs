@@ -3,6 +3,7 @@ mod apply;
 mod blob_shards;
 mod commit_pack;
 mod git_source;
+mod incremental;
 mod kernel_source;
 mod patch_header;
 mod series;
@@ -82,6 +83,22 @@ struct Cli {
     #[arg(short = '1', long)]
     one_shot: bool,
 
+    /// Add commits on top of an existing expanded repo: one commit per kernel-source commit
+    #[arg(long, conflicts_with_all = ["one_shot", "dry_run"])]
+    update: bool,
+
+    /// With --update: commit-ish in OUTPUT to build on [default: the branch given by -b]
+    #[arg(long, requires = "update")]
+    base: Option<String>,
+
+    /// With --update: kernel-source revision to expand up to [default: HEAD]
+    #[arg(long, requires = "update")]
+    rev: Option<String>,
+
+    /// With --update: allow moving the branch to a commit that doesn't descend from it
+    #[arg(long, requires = "update")]
+    force: bool,
+
     /// Change to <DIR> before doing anything (like make -C)
     #[arg(short = 'C', long, value_name = "DIR")]
     directory: Option<PathBuf>,
@@ -104,6 +121,28 @@ fn main() -> Result<()> {
             .num_threads(cli.jobs)
             .build_global()
             .context("building rayon thread pool")?;
+    }
+
+    if cli.update {
+        let n_shards = if cli.blob_shards == 0 {
+            std::thread::available_parallelism().map_or(4, |n| n.get().min(4))
+        } else {
+            cli.blob_shards
+        };
+        return incremental::run(&incremental::Params {
+            output: cli.output,
+            linux,
+            branch: cli.branch,
+            base: cli.base,
+            rev: cli.rev,
+            force: cli.force,
+            max_fuzz: cli.max_fuzz,
+            skip_failed: cli.skip_failed,
+            verbose: cli.verbose,
+            quiet: cli.quiet,
+            no_repack: cli.no_repack,
+            n_shards,
+        });
     }
 
     // Open kernel-source working tree at the current directory
@@ -274,7 +313,7 @@ fn main() -> Result<()> {
     if !cli.no_repack {
         let t_repack = Instant::now();
         if !cli.quiet { println!("Repacking..."); }
-        run_repack(&cli.output, cli.repack_threads)?;
+        run_repack(&cli.output.join(".git/objects/pack"), None)?;
         if !cli.quiet { println!("Repack done in {:.1}s", t_repack.elapsed().as_secs_f64()); }
     }
 
@@ -333,14 +372,20 @@ fn build_commits_pack(
 ///
 /// merged_offset(pack_i, in_pack_off) = cumulative_body[i] + in_pack_off
 /// where cumulative_body[0] = 0 and body_size = file_size − 32.
-fn run_repack(output: &Path, _threads: usize) -> Result<()> {
-    let pack_dir = output.join(".git/objects/pack");
+///
+/// With `only = Some(set)`, merge just the packs whose `.idx` path is in the set and
+/// leave all other packs untouched.
+pub(crate) fn run_repack(
+    pack_dir: &Path,
+    only: Option<&std::collections::HashSet<PathBuf>>,
+) -> Result<()> {
 
     let idx_files: Vec<PathBuf> = std::fs::read_dir(&pack_dir)
         .context("reading pack dir")?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| p.extension().map_or(false, |e| e == "idx"))
+        .filter(|p| only.map_or(true, |set| set.contains(p)))
         .collect();
 
     if idx_files.is_empty() {

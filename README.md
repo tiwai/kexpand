@@ -159,6 +159,23 @@ kernel-source working tree, then creates `~/git/suse-expanded` with a branch
 The output repo uses git alternates so it shares all upstream objects with the
 linux clone; only the new blobs and commit/tree objects are stored locally.
 
+## Incremental update (`--update`)
+
+Given an existing expanded repo whose commits carry a `suse-commit: <sha>` trailer
+(one commit per kernel-source commit), `--update` appends the newer kernel-source
+commits on top of it, mirroring the kernel-source DAG (merges, author/committer,
+message plus `suse-commit:` trailer).  Only the files touched by changed patches are
+recomputed; existing packs in OUTPUT are left untouched.
+
+```sh
+kexpand -C ~/kernel/suse/kernel-source --update -b SLE15-SP7 ~/kernel/suse/expand/kernel
+```
+
+- `-b` branch in OUTPUT to build on and update (default base: that branch)
+- `--base <rev>`: build on another commit-ish of OUTPUT instead
+- `--rev <rev>`: kernel-source revision to expand up to (default `HEAD`)
+- `--force`: allow moving the branch to a non-descendant commit
+
 ## How series.conf guards work
 
 Lines in `series.conf` are classified as follows:

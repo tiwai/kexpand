@@ -21,13 +21,7 @@ impl KernelSource {
     pub fn base_tag(&self) -> Result<String> {
         let bytes = fs::read(self.root.join("rpm/config.sh"))
             .context("reading rpm/config.sh")?;
-        let content = std::str::from_utf8(&bytes).context("rpm/config.sh is not UTF-8")?;
-        for line in content.lines() {
-            if let Some(val) = line.strip_prefix("SRCVERSION=") {
-                return Ok(format!("v{}", val.trim()));
-            }
-        }
-        bail!("SRCVERSION not found in rpm/config.sh")
+        parse_base_tag(&bytes)
     }
 
     /// Parse series.conf and return ordered patch paths.
@@ -49,4 +43,15 @@ impl KernelSource {
             })
             .collect()
     }
+}
+
+/// Extract SRCVERSION from the contents of rpm/config.sh as a git tag (e.g. "v6.4").
+pub fn parse_base_tag(bytes: &[u8]) -> Result<String> {
+    let content = std::str::from_utf8(bytes).context("rpm/config.sh is not UTF-8")?;
+    for line in content.lines() {
+        if let Some(val) = line.strip_prefix("SRCVERSION=") {
+            return Ok(format!("v{}", val.trim()));
+        }
+    }
+    bail!("SRCVERSION not found in rpm/config.sh")
 }

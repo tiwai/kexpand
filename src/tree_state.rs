@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::cmp::Ordering;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::apply::PatchResult;
 use crate::commit_pack::CommitPackWriter;
@@ -39,9 +39,106 @@ pub struct TreeState {
     /// BTreeSet gives sorted iteration (longer paths sort after shorter ones with
     /// the same prefix only when the comparison works out — we re-sort by depth in flush).
     dirty: HashSet<PathBuf>,
+    /// Lazy directory loader (incremental mode); `None` means all dirs were preloaded.
+    src: Option<TreeSource>,
+}
+
+/// Reads tree objects for lazy loading: trees written during this run (not yet on
+/// disk) are served from `mem`, everything else from the given repositories' ODBs.
+pub struct TreeSource {
+    mem: HashMap<git2::Oid, Vec<u8>>,
+    repos: Vec<git2::Repository>,
+}
+
+impl TreeSource {
+    pub fn new(repo_paths: &[&Path]) -> Result<Self> {
+        let repos = repo_paths.iter()
+            .map(|p| git2::Repository::open(p)
+                .with_context(|| format!("opening {}", p.display())))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(TreeSource { mem: HashMap::new(), repos })
+    }
+
+    fn read_entries(&self, oid: git2::Oid) -> Result<Vec<(String, DirEntry)>> {
+        let Some(raw) = self.mem.get(&oid) else {
+            for repo in &self.repos {
+                if let Ok(tree) = repo.find_tree(oid) {
+                    let mut entries: Vec<(String, DirEntry)> = tree.iter()
+                        .filter_map(|e| e.name().ok().filter(|n| !n.is_empty()).map(|n| {
+                            (n.to_string(), DirEntry { oid: e.id(), filemode: e.filemode_raw() as u32 })
+                        }))
+                        .collect();
+                    entries.sort_unstable_by(|(na, a), (nb, b)|
+                        git_tree_cmp(na, a.is_tree(), nb, b.is_tree()));
+                    return Ok(entries);
+                }
+            }
+            bail!("tree {oid} not found");
+        };
+        let mut entries = Vec::new();
+        let mut i = 0;
+        while i < raw.len() {
+            let sp = raw[i..].iter().position(|&b| b == b' ')
+                .context("corrupt tree: no mode terminator")? + i;
+            let mode = u32::from_str_radix(std::str::from_utf8(&raw[i..sp])?, 8)?;
+            let nul = raw[sp + 1..].iter().position(|&b| b == 0)
+                .context("corrupt tree: no name terminator")? + sp + 1;
+            let name = String::from_utf8_lossy(&raw[sp + 1..nul]).into_owned();
+            let oid = git2::Oid::from_bytes(&raw[nul + 1..nul + 21])?;
+            entries.push((name, DirEntry { oid, filemode: mode }));
+            i = nul + 21;
+        }
+        Ok(entries)
+    }
 }
 
 impl TreeState {
+    /// Build a lazily-loading TreeState rooted at an existing tree object.
+    pub fn from_tree(root_tree: git2::Oid, src: TreeSource) -> Result<Self> {
+        let entries = src.read_entries(root_tree)?;
+        let mut dirs = HashMap::new();
+        dirs.insert(PathBuf::new(), DirState { entries, oid: Some(root_tree) });
+        Ok(TreeState { dirs, dirty: HashSet::new(), src: Some(src) })
+    }
+
+    /// Re-root a lazy TreeState at another tree, keeping the loader (and the cache
+    /// of trees written so far).
+    pub fn reroot(&mut self, root_tree: git2::Oid) -> Result<()> {
+        let src = self.src.as_ref().context("reroot needs a lazy TreeState")?;
+        let entries = src.read_entries(root_tree)?;
+        self.dirs.clear();
+        self.dirty.clear();
+        self.dirs.insert(PathBuf::new(), DirState { entries, oid: Some(root_tree) });
+        Ok(())
+    }
+
+    /// Root tree OID of the current (flushed) state.
+    pub fn root_oid(&self) -> Option<git2::Oid> {
+        self.dirs.get(Path::new("")).and_then(|s| s.oid)
+    }
+
+    /// Make sure `dir` and all its ancestors are loaded (lazy mode only).
+    fn ensure_dir(&mut self, dir: &Path) -> Result<()> {
+        if self.dirs.contains_key(dir) {
+            return Ok(());
+        }
+        let parent = dir.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
+        self.ensure_dir(&parent)?;
+        let name = dir.file_name().and_then(|n| n.to_str())
+            .ok_or_else(|| anyhow::anyhow!("bad dir path {}", dir.display()))?;
+        let child = {
+            let pstate = &self.dirs[&parent];
+            pstate.entries.binary_search_by(|(n, e)| git_tree_cmp(n, e.is_tree(), name, true))
+                .ok().map(|i| pstate.entries[i].1.oid)
+        };
+        let state = match (child, &self.src) {
+            (Some(oid), Some(src)) => DirState { entries: src.read_entries(oid)?, oid: Some(oid) },
+            _ => DirState { entries: Vec::new(), oid: None },
+        };
+        self.dirs.insert(dir.to_path_buf(), state);
+        Ok(())
+    }
+
     /// Build a TreeState by eagerly loading every directory (and its ancestors)
     /// touched by any blob or deletion in `patch_results` from the linus base commit.
     pub fn new(
@@ -74,7 +171,7 @@ impl TreeState {
             dirs.insert(dir_path, DirState { entries, oid: tree_oid });
         }
 
-        Ok(TreeState { dirs, dirty: HashSet::new() })
+        Ok(TreeState { dirs, dirty: HashSet::new(), src: None })
     }
 
     /// Record a blob add/modify at `path`.
@@ -84,6 +181,7 @@ impl TreeState {
             .and_then(|n| n.to_str())
             .ok_or_else(|| anyhow::anyhow!("path has no filename: {}", path.display()))?;
 
+        self.ensure_dir(dir)?;
         let state = self.dirs.get_mut(dir)
             .ok_or_else(|| anyhow::anyhow!("directory not found: {}", dir.display()))?;
         let target_is_tree = mode == 0o040000;
@@ -108,6 +206,9 @@ impl TreeState {
             .and_then(|n| n.to_str())
             .ok_or_else(|| anyhow::anyhow!("path has no filename: {}", path.display()))?;
 
+        if self.src.is_some() {
+            self.ensure_dir(dir)?;
+        }
         if let Some(state) = self.dirs.get_mut(dir) {
             let idx = state.entries.binary_search_by(|(n, entry)| {
                 git_tree_cmp(n, entry.is_tree(), name, false)
@@ -142,6 +243,23 @@ impl TreeState {
                 continue;
             }
 
+            // Git has no empty trees: drop an emptied directory from its parent.
+            if !dir_path.as_os_str().is_empty()
+                && self.dirs.get(dir_path).unwrap().entries.is_empty()
+            {
+                if let Some(dir_name) = dir_path.file_name().and_then(|n| n.to_str()) {
+                    let parent = dir_path.parent().unwrap_or_else(|| Path::new(""));
+                    let parent_state = self.dirs.get_mut(parent).unwrap();
+                    if let Ok(idx) = parent_state.entries.binary_search_by(|(n, entry)| {
+                        git_tree_cmp(n, entry.is_tree(), dir_name, true)
+                    }) {
+                        parent_state.entries.remove(idx);
+                    }
+                    parent_state.oid = None;
+                }
+                continue;
+            }
+
             // Encode the current entries of this directory
             let tree_bytes = {
                 let state = self.dirs.get(dir_path).unwrap();
@@ -153,6 +271,9 @@ impl TreeState {
 
             // Cache the fresh OID
             self.dirs.get_mut(dir_path).unwrap().oid = Some(oid);
+            if let Some(src) = &mut self.src {
+                src.mem.insert(oid, tree_bytes);
+            }
 
             // Update this directory's entry in its parent
             if let Some(dir_name) = dir_path.file_name().and_then(|n| n.to_str()) {
@@ -324,6 +445,29 @@ pub fn encode_commit(
     }
 
     s.into_bytes()
+}
+
+/// Encode a commit that mirrors a kernel-source commit: `header_lines` are the raw
+/// author/committer (and encoding) header lines copied verbatim, `message` is the
+/// original message; a `suse-commit:` trailer referencing `ks_commit` is appended.
+pub fn encode_commit_raw(
+    tree_oid: git2::Oid,
+    parents: &[git2::Oid],
+    header_lines: &[u8],
+    message: &[u8],
+    ks_commit: git2::Oid,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(header_lines.len() + message.len() + 200);
+    out.extend_from_slice(format!("tree {tree_oid}\n").as_bytes());
+    for p in parents {
+        out.extend_from_slice(format!("parent {p}\n").as_bytes());
+    }
+    out.extend_from_slice(header_lines);
+    out.extend_from_slice(b"\n");
+    let end = message.iter().rposition(|&b| b != b'\n').map_or(0, |i| i + 1);
+    out.extend_from_slice(&message[..end]);
+    out.extend_from_slice(format!("\n\nsuse-commit: {ks_commit}\n").as_bytes());
+    out
 }
 
 // ─── Base-tree loading helpers ────────────────────────────────────────────────
