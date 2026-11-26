@@ -301,16 +301,20 @@ pub fn run(p: &Params) -> Result<()> {
     let out = Repository::open(&p.output)
         .with_context(|| format!("opening output repo {} (must already exist)", p.output.display()))?;
 
-    // Resolve base commit in the expanded repo and its kernel-source counterpart.
+    // Resolve the base branch/commit in the expanded repo, then the kernel-source target.
     let base_spec = p.base.clone().unwrap_or_else(|| format!("refs/heads/{}", p.branch));
-    let base_commit = out.revparse_single(&base_spec)
-        .with_context(|| format!("resolving base '{base_spec}' in output repo"))?
+    let tip_commit = out.revparse_single(&base_spec)
+        .with_context(|| format!(
+            "resolving base '{base_spec}' in output repo (to start a new branch, give --base <existing branch>)"))?
         .peel_to_commit()?;
-    let ks_base = suse_commit_of(base_commit.message().unwrap_or(""))
-        .context("base commit has no 'suse-commit:' tag")?;
+    let tip_ks = suse_commit_of(tip_commit.message().unwrap_or(""))
+        .with_context(|| format!("base commit {} has no 'suse-commit:' tag", tip_commit.id()))?;
     let target = ks.revparse_single(p.rev.as_deref().unwrap_or("HEAD"))
         .context("resolving kernel-source target revision")?
         .peel_to_commit()?;
+    let (ks_base, base_commit) =
+        find_base(&ks, &out, target.id(), tip_commit, tip_ks, &base_spec, p.quiet)?;
+    let refname = format!("refs/heads/{}", p.branch);
 
     // Commits to expand, parents first.
     let mut walk = ks.revwalk()?;
@@ -321,7 +325,12 @@ pub fn run(p: &Params) -> Result<()> {
     let order: Vec<Oid> = walk.collect::<std::result::Result<_, _>>()?;
     if !p.quiet { println!("Base: {} (suse-commit {}), {} commits to expand", base_commit.id(), ks_base, order.len()); }
     if order.is_empty() {
-        println!("Already up to date");
+        if out.refname_to_id(&refname).is_err() {
+            update_ref(&out, &refname, base_commit.id(), p.force)?;
+            if !p.quiet { println!("{refname} -> {}", base_commit.id()); }
+        } else {
+            println!("Already up to date");
+        }
         return Ok(());
     }
     let in_range: HashSet<Oid> = order.iter().copied().collect();
@@ -345,41 +354,18 @@ pub fn run(p: &Params) -> Result<()> {
     }
     if !needed.is_empty() {
         if !p.quiet { println!("Locating {} boundary parent(s) in output history...", needed.len()); }
-        // The expanded history mirrors the kernel-source DAG, so walk both in lockstep
-        // (newest first) from the base: the parents of a mapped commit correspond, in
-        // order, to the parents of its expanded counterpart (minus unexpandable ones).
-        let mut mapped: HashMap<Oid, Oid> = HashMap::new();
-        mapped.insert(ks_base, base_commit.id());
-        let mut heap = std::collections::BinaryHeap::new();
-        heap.push((ks.find_commit(ks_base)?.time().seconds(), ks_base));
-        let mut visited: HashSet<Oid> = HashSet::new();
-        while let Some((_, x)) = heap.pop() {
-            if !visited.insert(x) { continue; }
+        // Match by `suse-commit:` trailer while walking the expanded history from the base
+        // (the expanded DAG need not mirror the kernel-source one exactly, e.g. for the
+        // first commit of a branch, which also has the upstream base as parent).
+        let mut walk = out.revwalk()?;
+        walk.set_sorting(git2::Sort::TIME)?;
+        walk.push(base_commit.id())?;
+        for id in walk {
             if needed.is_empty() { break; }
-            let e = out.find_commit(mapped[&x])?;
-            let kx = ks.find_commit(x)?;
-            let mut kp: Vec<Oid> = kx.parent_ids().collect();
-            let ep: Vec<Oid> = e.parent_ids().collect();
-            if kp.len() != ep.len() {
-                let mut f = Vec::new();
-                for q in kp {
-                    if is_expandable(&ks.find_commit(q)?.tree()?) { f.push(q); }
-                }
-                kp = f;
-            }
-            if kp.len() != ep.len() {
-                bail!("cannot map parents of kernel-source commit {x} to expanded commit {}", e.id());
-            }
-            for (q, eq) in kp.into_iter().zip(ep) {
-                if mapped.insert(q, eq).is_none() {
-                    heap.push((ks.find_commit(q)?.time().seconds(), q));
-                }
-                if needed.remove(&q) {
-                    let c = out.find_commit(eq)?;
-                    if suse_commit_of(c.message().unwrap_or("")) != Some(q) {
-                        bail!("expanded commit {eq} does not carry suse-commit {q}");
-                    }
-                    exp.insert(q, Some(Expanded { commit: eq, tree: c.tree_id() }));
+            let c = out.find_commit(id?)?;
+            if let Some(k) = suse_commit_of(c.message().unwrap_or("")) {
+                if needed.remove(&k) {
+                    exp.insert(k, Some(Expanded { commit: c.id(), tree: c.tree_id() }));
                 }
             }
         }
@@ -565,13 +551,7 @@ pub fn run(p: &Params) -> Result<()> {
 
     // Update the branch only after every object is on disk.
     let out = Repository::open(&p.output)?;
-    let refname = format!("refs/heads/{}", p.branch);
-    if let Ok(old) = out.refname_to_id(&refname) {
-        if old != tip && !out.graph_descendant_of(tip, old)? && !p.force {
-            bail!("{refname} ({old}) is not an ancestor of the new tip {tip}; use --force");
-        }
-    }
-    out.reference(&refname, tip, true, "kexpand --update")?;
+    update_ref(&out, &refname, tip, p.force)?;
     if !p.quiet {
         println!("{n_done} kernel-source commits processed, {n_files} files recomputed; {refname} -> {tip}");
     }
@@ -584,6 +564,52 @@ pub fn run(p: &Params) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Move `refname` to `tip`; refuse non-fast-forward moves unless `force`.
+fn update_ref(out: &Repository, refname: &str, tip: Oid, force: bool) -> Result<()> {
+    if let Ok(old) = out.refname_to_id(refname) {
+        if old != tip && !out.graph_descendant_of(tip, old)? && !force {
+            bail!("{refname} ({old}) is not an ancestor of the new tip {tip}; use --force");
+        }
+    }
+    out.reference(refname, tip, true, "kexpand --update")?;
+    Ok(())
+}
+
+/// Find the newest commit reachable from `tip` in the expanded repo whose `suse-commit:`
+/// is an ancestor of (or equal to) the merge base of `target` and the tip's kernel-source
+/// commit.  Returns the kernel-source commit and its expanded counterpart.
+fn find_base<'o>(
+    ks: &Repository,
+    out: &'o Repository,
+    target: Oid,
+    tip: git2::Commit<'o>,
+    tip_ks: Oid,
+    spec: &str,
+    quiet: bool,
+) -> Result<(Oid, git2::Commit<'o>)> {
+    let mb = ks.merge_base(target, tip_ks)
+        .with_context(|| format!("no common ancestor between target {target} and base suse-commit {tip_ks}"))?;
+    if mb == tip_ks {
+        return Ok((tip_ks, tip));
+    }
+    // All kernel-source commits at or below the merge base (one walk, O(1) lookups below).
+    let mut kw = ks.revwalk()?;
+    kw.push(mb)?;
+    let ancestors: HashSet<Oid> = kw.collect::<std::result::Result<_, _>>()?;
+    let mut walk = out.revwalk()?;
+    walk.set_sorting(git2::Sort::TIME)?;
+    walk.push(tip.id())?;
+    for id in walk {
+        let c = out.find_commit(id?)?;
+        let Some(k) = suse_commit_of(c.message().unwrap_or("")) else { continue };
+        if ancestors.contains(&k) {
+            if !quiet { println!("Base point: {} (suse-commit {k}) on {spec}", c.id()); }
+            return Ok((k, c));
+        }
+    }
+    bail!("no expanded commit on '{spec}' corresponds to an ancestor of the target {target}")
 }
 
 fn list_idx(pack_dir: &Path) -> Result<HashSet<PathBuf>> {

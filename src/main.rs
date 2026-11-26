@@ -87,7 +87,8 @@ struct Cli {
     #[arg(long, conflicts_with_all = ["one_shot", "dry_run"])]
     update: bool,
 
-    /// With --update: commit-ish in OUTPUT to build on [default: the branch given by -b]
+    /// With --update: branch/commit-ish in OUTPUT to build on; the newest commit on it whose
+    /// kernel-source commit is an ancestor of --rev is used [default: the branch given by -b]
     #[arg(long, requires = "update")]
     base: Option<String>,
 

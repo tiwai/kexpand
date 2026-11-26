@@ -120,10 +120,12 @@ at most 4 shards are used.
 .BI "\-\-base " REV
 With
 .BR \-\-update :
-commit-ish in
+branch or commit-ish in
 .I OUTPUT
-to build on.  Its \fBsuse-commit:\fR trailer names the kernel-source commit already
-expanded.  Default: the branch given by
+to build on.  The base point is the newest commit reachable from it whose
+\fBsuse-commit:\fR is an ancestor of the target (the merge base of the target and
+the commit's \fBsuse-commit:\fR); if the expanded history is behind or lacks commits,
+earlier ones are used.  Default: the branch given by
 .BR \-b .
 .TP
 .BI "\-\-rev " REV
@@ -224,6 +226,14 @@ between a commit and its parent are recomputed; all other files are taken from t
 parent's expanded tree.  Patches and \fIseries.conf\fR are read from kernel-source
 git objects, not from the working tree.  The branch is updated only after all
 objects are written, and only the packs created by the run are merged.
+.PP
+When the target is not a descendant of the base's \fBsuse-commit:\fR (for example
+a new branch forked from another one), the base point is searched back along the
+base's history as described for
+.BR \-\-base .
+If the branch given by
+.B \-b
+does not exist yet it is created.
 .SH NOTES
 Binary patches (\fBGIT binary patch\fR or \fBbinary\fR metadata) are silently
 skipped; a diagnostic line is printed to stderr.

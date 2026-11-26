@@ -172,7 +172,12 @@ kexpand -C ~/kernel/suse/kernel-source --update -b SLE15-SP7 ~/kernel/suse/expan
 ```
 
 - `-b` branch in OUTPUT to build on and update (default base: that branch)
-- `--base <rev>`: build on another commit-ish of OUTPUT instead
+- `--base <rev>`: build on another branch/commit-ish of OUTPUT instead.  The base point is
+  chosen automatically: the newest commit on it whose `suse-commit:` is an ancestor of
+  `--rev` (the merge base with the target).  If the expanded tree is behind kernel-source
+  or lacks commits, kexpand goes further back and expands the missing ones.  This lets you
+  start a new branch from an existing one:
+  `kexpand -C ~/kernel/suse/kernel-source --update -b X --base SLE15-SP7 --rev X OUTPUT`
 - `--rev <rev>`: kernel-source revision to expand up to (default `HEAD`)
 - `--force`: allow moving the branch to a non-descendant commit
 
