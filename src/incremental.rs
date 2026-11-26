@@ -357,18 +357,14 @@ pub fn run(p: &Params) -> Result<()> {
         // Match by `suse-commit:` trailer while walking the expanded history from the base
         // (the expanded DAG need not mirror the kernel-source one exactly, e.g. for the
         // first commit of a branch, which also has the upstream base as parent).
-        let mut walk = out.revwalk()?;
-        walk.set_sorting(git2::Sort::TIME)?;
-        walk.push(base_commit.id())?;
-        for id in walk {
-            if needed.is_empty() { break; }
-            let c = out.find_commit(id?)?;
+        walk_expanded(&out, base_commit.id(), |c| {
             if let Some(k) = suse_commit_of(c.message().unwrap_or("")) {
                 if needed.remove(&k) {
                     exp.insert(k, Some(Expanded { commit: c.id(), tree: c.tree_id() }));
                 }
             }
-        }
+            needed.is_empty()
+        })?;
         if let Some(k) = needed.iter().next() {
             bail!("kernel-source parent {k} not found in output history (not expanded yet?)");
         }
@@ -566,6 +562,31 @@ pub fn run(p: &Params) -> Result<()> {
     Ok(())
 }
 
+/// Visit commits reachable from `start`, newest committer time first, until `visit`
+/// returns true.  (A hand-rolled walk: libgit2's time-sorted revwalk takes ~20s to
+/// produce its first commit on large expanded repos.)
+fn walk_expanded<'o>(
+    out: &'o Repository,
+    start: Oid,
+    mut visit: impl FnMut(&git2::Commit<'o>) -> bool,
+) -> Result<()> {
+    let mut heap = std::collections::BinaryHeap::new();
+    let mut seen: HashSet<Oid> = HashSet::new();
+    let c = out.find_commit(start)?;
+    heap.push((c.time().seconds(), start));
+    seen.insert(start);
+    while let Some((_, id)) = heap.pop() {
+        let c = out.find_commit(id)?;
+        if visit(&c) { break; }
+        for par in c.parent_ids() {
+            if seen.insert(par) {
+                heap.push((out.find_commit(par)?.time().seconds(), par));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Move `refname` to `tip`; refuse non-fast-forward moves unless `force`.
 fn update_ref(out: &Repository, refname: &str, tip: Oid, force: bool) -> Result<()> {
     if let Ok(old) = out.refname_to_id(refname) {
@@ -594,20 +615,25 @@ fn find_base<'o>(
     if mb == tip_ks {
         return Ok((tip_ks, tip));
     }
-    // All kernel-source commits at or below the merge base (one walk, O(1) lookups below).
+    // Kernel-source commits on the tip's side only (cheap: bounded by the merge base).
+    // The expanded history of the tip consists of ancestors of `tip_ks`, so any of its
+    // commits whose suse-commit is not in this set lies at or below the merge base.
     let mut kw = ks.revwalk()?;
-    kw.push(mb)?;
-    let ancestors: HashSet<Oid> = kw.collect::<std::result::Result<_, _>>()?;
-    let mut walk = out.revwalk()?;
-    walk.set_sorting(git2::Sort::TIME)?;
-    walk.push(tip.id())?;
-    for id in walk {
-        let c = out.find_commit(id?)?;
-        let Some(k) = suse_commit_of(c.message().unwrap_or("")) else { continue };
-        if ancestors.contains(&k) {
-            if !quiet { println!("Base point: {} (suse-commit {k}) on {spec}", c.id()); }
-            return Ok((k, c));
+    kw.push(tip_ks)?;
+    kw.hide(mb)?;
+    let tip_only: HashSet<Oid> = kw.collect::<std::result::Result<_, _>>()?;
+    let mut found: Option<(Oid, git2::Commit<'o>)> = None;
+    walk_expanded(out, tip.id(), |c| {
+        let Some(k) = suse_commit_of(c.message().unwrap_or("")) else { return false };
+        if !tip_only.contains(&k) && ks.find_commit(k).is_ok() {
+            found = Some((k, c.clone()));
+            return true;
         }
+        false
+    })?;
+    if let Some((k, c)) = found {
+        if !quiet { println!("Base point: {} (suse-commit {k}) on {spec}", c.id()); }
+        return Ok((k, c));
     }
     bail!("no expanded commit on '{spec}' corresponds to an ancestor of the target {target}")
 }
